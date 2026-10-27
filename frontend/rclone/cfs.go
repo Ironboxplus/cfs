@@ -35,6 +35,7 @@ func init() {
 		Name:        "cfs",
 		Description: "Small-file packing filesystem over a rate-limited remote",
 		NewFs:       NewFs,
+		CommandHelp: commandHelp,
 		Options: []fs.Option{{
 			Name:     "remote",
 			Help:     "Remote (the drive) to keep the volume on, e.g. \"mydrive:cfs-volume\".",
@@ -218,6 +219,8 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 			return nil, err
 		}
 		ref = &volRef{v: v, meter: meter, key: key}
+		startStats(ref)
+		registerExit()
 		volumes[key] = ref
 	}
 	ref.refs++
@@ -543,3 +546,61 @@ func CloseAll(ctx context.Context) error {
 	}
 	return first
 }
+
+var commandHelp = []fs.CommandHelp{{
+	Name:  "fsck",
+	Short: "Check the index, packs and large files against each other and the drive's log.",
+	Long: `Reports problems, and fixes the safe ones only with -o repair=true.
+Use -o deep=true to read every pack and verify every packed file's SHA-1.
+
+    rclone backend fsck cfs:
+`,
+}, {
+	Name:  "checkpoint",
+	Short: "Upload a checkpoint of the index now.",
+}, {
+	Name:  "maintain",
+	Short: "Compact packs with dead space, checkpoint, and delete what nothing refers to any more.",
+}, {
+	Name:  "flush",
+	Short: "Make everything accepted so far durable on the drive.",
+}, {
+	Name:  "stats",
+	Short: "Calls, bytes and peak in-flight counts seen by the drive since the volume was opened.",
+}}
+
+// Command runs the backend commands.
+func (f *Fs) Command(ctx context.Context, name string, arg []string, opt map[string]string) (any, error) {
+	switch name {
+	case "fsck":
+		rep, err := f.vol.Fsck(ctx, core.FsckOpts{Deep: opt["deep"] == "true", Repair: opt["repair"] == "true"})
+		if err != nil {
+			return nil, err
+		}
+		probs := make([]string, 0, len(rep.Problems))
+		for _, p := range rep.Problems {
+			probs = append(probs, p.String())
+		}
+		return map[string]any{"ok": rep.OK(), "packs": rep.Packs, "members": rep.Members, "segments": rep.Segments,
+			"repaired": rep.Repaired, "problems": probs}, nil
+	case "checkpoint":
+		return map[string]any{}, f.vol.Checkpoint(ctx)
+	case "flush":
+		return map[string]any{}, f.vol.Flush(ctx)
+	case "maintain":
+		c, g, err := f.vol.Maintain(ctx)
+		return map[string]any{"compacted_packs": c.PacksCompacted, "members_moved": c.MembersMoved,
+			"packs_deleted": g.PacksDeleted, "orphans_deleted": g.OrphansDeleted,
+			"segments_deleted": g.SegmentsDeleted, "checkpoints_deleted": g.CheckpointsDeleted, "dead_packs": g.DeadPacks}, err
+	case "stats":
+		if f.ref.meter == nil {
+			return map[string]any{}, nil
+		}
+		s := f.ref.meter.Snapshot()
+		return map[string]any{"calls": s.Calls, "total": s.Total, "bytes_read": s.BytesRead, "bytes_written": s.BytesWritten,
+			"peak_meta": s.PeakMeta, "peak_transfer": s.PeakTransfer}, nil
+	}
+	return nil, fs.ErrorCommandNotFound
+}
+
+var _ fs.Commander = (*Fs)(nil)
