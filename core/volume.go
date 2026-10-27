@@ -82,6 +82,8 @@ type Volume struct {
 
 	dc      *dirCache
 	mc      *memCache
+	wc      *memCache    // read windows of packs
+	packSz  sync.Map     // pack name -> bytes
 	segsNew atomic.Int64 // segments committed since the last checkpoint
 	ckptRun atomic.Bool
 	ckptOne sync.Mutex // one Checkpoint at a time
@@ -117,6 +119,7 @@ func Open(ctx context.Context, st store.Store, cfg Config) (*Volume, error) {
 		slots:    make(chan struct{}, cfg.Pipeline+1),
 		dc:       newDirCache(cfg.DirCacheTTL),
 		mc:       newMemCache(cfg.MemberCache),
+		wc:       newMemCache(32 << 20),
 	}
 	v.ctx, v.cancel = context.WithCancel(context.Background())
 	if err := os.MkdirAll(filepath.Join(cfg.StateDir, "spool"), 0o755); err != nil {

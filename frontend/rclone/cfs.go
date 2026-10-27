@@ -85,6 +85,11 @@ func init() {
 			Default:  fs.SizeSuffix(8 << 20),
 			Advanced: true,
 		}, {
+			Name:     "read_window",
+			Help:     "Reading a packed file fetches the aligned window of this size around it from the pack, so that reading neighbours costs one request per window. Negative disables.",
+			Default:  fs.SizeSuffix(512 << 10),
+			Advanced: true,
+		}, {
 			Name:     "dir_cache",
 			Help:     "How long directory listings of the remote are trusted.",
 			Default:  fs.Duration(5 * time.Minute),
@@ -125,6 +130,7 @@ type Options struct {
 	MetaInflight    int           `config:"meta_inflight"`
 	Transfers       int           `config:"transfers"`
 	ReadChunk       fs.SizeSuffix `config:"read_chunk"`
+	ReadWindow      fs.SizeSuffix `config:"read_window"`
 	DirCache        fs.Duration   `config:"dir_cache"`
 	LeaseTTL        fs.Duration   `config:"lease_ttl"`
 	GCGrace         fs.Duration   `config:"gc_grace"`
@@ -207,6 +213,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 			SealQuiet:       time.Duration(opt.SealQuiet),
 			SealMax:         time.Duration(opt.SealMax),
 			ReadChunk:       int64(opt.ReadChunk),
+			ReadWindow:      int64(opt.ReadWindow),
 			Pipeline:        opt.Transfers,
 			DirCacheTTL:     time.Duration(opt.DirCache),
 			LeaseTTL:        time.Duration(opt.LeaseTTL),

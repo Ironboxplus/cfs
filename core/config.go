@@ -69,6 +69,11 @@ type Config struct {
 	// Threshold but not smaller than Threshold*Shrink (hysteresis, so a file
 	// hovering near the threshold doesn't move back and forth). Default 0.5.
 	Shrink float64
+	// ReadWindow: reading a packed file fetches the aligned window of this size
+	// around it from the pack, so reading neighbours (a directory listing, a
+	// tree walk) costs one request per window instead of one per file. Default
+	// 512 KiB; negative disables.
+	ReadWindow int64
 	// MemberCache is the size of the in-memory cache of recently read pack
 	// members. Default 64 MiB; negative disables.
 	MemberCache int64
@@ -119,6 +124,9 @@ func (c *Config) fill() error {
 	}
 	if c.Shrink <= 0 || c.Shrink > 1 {
 		c.Shrink = 0.5
+	}
+	if c.ReadWindow == 0 {
+		c.ReadWindow = 512 << 10
 	}
 	if c.MemberCache == 0 {
 		c.MemberCache = 64 << 20

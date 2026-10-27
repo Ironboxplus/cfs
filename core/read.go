@@ -112,19 +112,14 @@ func (v *Volume) memberBytes(ctx context.Context, r fileRow) ([]byte, error) {
 	if d, ok := v.mc.get(key); ok {
 		return d, nil
 	}
-	rc, err := v.st.Open(ctx, CtlDir+"/packs/"+r.Pack, r.Off, r.CSize)
-	if err != nil {
-		return nil, fmt.Errorf("cfs: read pack %s for %s: %w", r.Pack, r.Path, err)
-	}
-	raw, err := io.ReadAll(rc)
-	rc.Close()
+	raw, err := v.packRange(ctx, r.Pack, r.Off, r.CSize)
 	if err != nil {
 		return nil, fmt.Errorf("cfs: read pack %s for %s: %w", r.Pack, r.Path, err)
 	}
 	if int64(len(raw)) != r.CSize {
 		return nil, fmt.Errorf("cfs: pack %s: got %d bytes for %s, expected %d: %w", r.Pack, len(raw), r.Path, r.CSize, ErrCorrupt)
 	}
-	data := raw
+	data := bytes.Clone(raw) // raw may alias a shared read window
 	if r.Meth == 8 {
 		data, err = io.ReadAll(flate.NewReader(bytes.NewReader(raw)))
 		if err != nil {
@@ -137,4 +132,51 @@ func (v *Volume) memberBytes(ctx context.Context, r fileRow) ([]byte, error) {
 	}
 	v.mc.put(key, data)
 	return data, nil
+}
+
+func (v *Volume) packBytes(pack string) int64 {
+	if x, ok := v.packSz.Load(pack); ok {
+		return x.(int64)
+	}
+	var n int64
+	if v.ix.db.QueryRow("SELECT bytes FROM packs WHERE name=?", pack).Scan(&n) == nil && n > 0 {
+		v.packSz.Store(pack, n)
+	}
+	return n
+}
+
+// packRange returns n bytes of a pack at off. Small ranges are served from the
+// aligned window around them, fetched once per window.
+func (v *Volume) packRange(ctx context.Context, pack string, off, n int64) ([]byte, error) {
+	read := func(from, count int64) ([]byte, error) {
+		rc, err := v.st.Open(ctx, CtlDir+"/packs/"+pack, from, count)
+		if err != nil {
+			return nil, err
+		}
+		defer rc.Close()
+		return io.ReadAll(rc)
+	}
+	w := v.cfg.ReadWindow
+	if w > 0 && n <= w/2 && off/w == (off+n-1)/w {
+		idx := off / w
+		start := idx * w
+		key := fmt.Sprintf("%s#%d", pack, idx)
+		buf, ok := v.wc.get(key)
+		if !ok {
+			count := w
+			if size := v.packBytes(pack); size > 0 && start+count > size {
+				count = size - start
+			}
+			var err error
+			if buf, err = read(start, count); err != nil {
+				return nil, err
+			}
+			v.wc.put(key, buf)
+		}
+		if off-start+n > int64(len(buf)) {
+			return nil, fmt.Errorf("short read: pack window has %d bytes, member ends at %d: %w", len(buf), off-start+n, io.ErrUnexpectedEOF)
+		}
+		return buf[off-start : off-start+n], nil
+	}
+	return read(off, n)
 }

@@ -1,11 +1,13 @@
 package core
 
 import (
+	"archive/zip"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -111,6 +113,15 @@ func (v *Volume) catchUp(ctx context.Context) error {
 		return err
 	}
 	base := v.ix.kvUint("base_seq")
+	if len(refs) == 0 && base == 0 {
+		var n int
+		v.ix.db.QueryRow("SELECT count(*) FROM packs").Scan(&n)
+		if cks, _ := v.log.ListCheckpoints(ctx); n == 0 && len(cks) == 0 {
+			if err := v.recoverFromPacks(ctx); err != nil {
+				return err
+			}
+		}
+	}
 	known := map[string]bool{}
 	rows, err := v.ix.db.Query("SELECT name FROM segs")
 	if err != nil {
@@ -321,4 +332,89 @@ func (v *Volume) maybeCheckpoint() {
 			v.logf("cfs: checkpoint: %v", err)
 		}
 	}()
+}
+
+// packReaderAt reads a pack on the drive through ranged requests, so that
+// archive/zip can find the central directory at the end without downloading it.
+type packReaderAt struct {
+	ctx  context.Context
+	st   store.Store
+	path string
+}
+
+func (r *packReaderAt) ReadAt(p []byte, off int64) (int, error) {
+	rc, err := r.st.Open(r.ctx, r.path, off, int64(len(p)))
+	if err != nil {
+		return 0, err
+	}
+	defer rc.Close()
+	return io.ReadFull(rc, p)
+}
+
+// recoverFromPacks rebuilds the index from the manifests the packs carry
+// themselves. It is the last resort when the drive has packs but no usable log
+// or checkpoint. Packs are applied in sequence order, so the newest version of
+// each path wins; what the log would have said about deletions and renames made
+// after a pack was written is gone, so such files come back under the name they
+// had when they were packed.
+func (v *Volume) recoverFromPacks(ctx context.Context) error {
+	ents, err := v.st.List(ctx, CtlDir+"/packs")
+	if err != nil {
+		if isNotFound(err) {
+			return nil
+		}
+		return err
+	}
+	type pk struct {
+		name       string
+		epoch, seq uint64
+		size       int64
+	}
+	var packs []pk
+	for _, e := range ents {
+		if m := packRE.FindStringSubmatch(e.Name()); m != nil && !e.IsDir {
+			ep, _ := strconv.ParseUint(m[1], 10, 64)
+			sq, _ := strconv.ParseUint(m[2], 10, 64)
+			packs = append(packs, pk{e.Name(), ep, sq, e.Size})
+		}
+	}
+	sort.Slice(packs, func(i, j int) bool { return packs[i].seq < packs[j].seq })
+	if len(packs) == 0 {
+		return nil
+	}
+	v.logf("cfs: no log or checkpoint on the drive: rebuilding the index from the manifests of %d packs", len(packs))
+	for _, p := range packs {
+		ra := &packReaderAt{ctx: ctx, st: v.st, path: CtlDir + "/packs/" + p.name}
+		zr, err := zip.NewReader(ra, p.size)
+		if err != nil {
+			v.logf("cfs: pack %s unreadable, skipped: %v", p.name, err)
+			continue
+		}
+		var man *zip.File
+		for _, f := range zr.File {
+			if f.Name == manifestName {
+				man = f
+			}
+		}
+		if man == nil {
+			v.logf("cfs: pack %s has no manifest, skipped", p.name)
+			continue
+		}
+		rc, err := man.Open()
+		if err != nil {
+			continue
+		}
+		var pm packManifest
+		err = json.NewDecoder(rc).Decode(&pm)
+		rc.Close()
+		if err != nil {
+			v.logf("cfs: pack %s manifest unreadable, skipped: %v", p.name, err)
+			continue
+		}
+		seg := metalog.Segment{Epoch: p.epoch, Seq: p.seq, Pack: p.name, PackBytes: p.size, PackN: len(pm.Members), Records: pm.Members}
+		if err := v.applySegment(seg); err != nil {
+			return err
+		}
+	}
+	return nil
 }

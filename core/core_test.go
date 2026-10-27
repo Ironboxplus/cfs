@@ -316,3 +316,19 @@ func TestTransfersOverlap(t *testing.T) {
 	e.assertPeaks(1, 8)
 }
 func aspectOpts() aspect.Options { return aspect.Options{} }
+
+func TestListAfterDirMoveKeepsSiblings(t *testing.T) {
+	ctx := context.Background()
+	e := newEnv(t, aspect.Options{}, nil)
+	e.put("d2/s1/f5", []byte("x"))
+	e.put("d1/s1/f", []byte("y"))
+	if n := e.listNames("d2"); fmt.Sprint(n) != "[s1/]" {
+		t.Fatalf("before: %v", n)
+	}
+	if err := e.v.DirMove(ctx, "d1/s1", "d2/s4"); err != nil {
+		t.Fatal(err)
+	}
+	if n := e.listNames("d2"); fmt.Sprint(n) != "[s1/ s4/]" {
+		t.Fatalf("after dirmove: %v", n)
+	}
+}

@@ -529,7 +529,7 @@ func (v *Volume) deepCheckPack(ctx context.Context, name, wantSHA string, rows [
 		h.Write(chunk)
 		buf = append(buf, chunk...)
 	}
-	if got := hex.EncodeToString(h.Sum(nil)); got != wantSHA {
+	if got := hex.EncodeToString(h.Sum(nil)); wantSHA != "" && got != wantSHA {
 		add("pack_checksum", name, "sha1 is %s, the index says %s", got, wantSHA)
 	}
 	for _, r := range rows {
