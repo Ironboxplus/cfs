@@ -278,13 +278,20 @@ func (v *Volume) Checkpoint(ctx context.Context) error {
 	if err := v.flushMeta(ctx); err != nil {
 		return err
 	}
-	tmp := filepath.Join(v.cfg.StateDir, "spool", fmt.Sprintf("ckpt-%d.db", v.ix.kvUint("next_seq")))
-	os.Remove(tmp)
+	v.ckptOne.Lock()
+	defer v.ckptOne.Unlock()
+	tf, err := os.CreateTemp(filepath.Join(v.cfg.StateDir, "spool"), "ckpt-*.db")
+	if err != nil {
+		return err
+	}
+	tmp := tf.Name()
+	tf.Close()
+	os.Remove(tmp) // VACUUM INTO wants to create the file itself
 	defer os.Remove(tmp)
 	v.structMu.Lock()
 	v.ckptMu.Lock()
 	seq := v.ix.kvUint("next_seq") - 1
-	_, err := v.ix.db.Exec("VACUUM INTO ?", tmp)
+	_, err = v.ix.db.Exec("VACUUM INTO ?", tmp)
 	v.ckptMu.Unlock()
 	v.structMu.Unlock()
 	if err != nil {

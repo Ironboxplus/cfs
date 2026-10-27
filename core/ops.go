@@ -146,7 +146,13 @@ func (v *Volume) putLarge(ctx context.Context, p string, r io.Reader, size int64
 	if err := v.mkdirAll(ctx, parentOf(p)); err != nil {
 		return Entry{}, err
 	}
-	if err := v.st.Put(ctx, p, store.Once(r), store.PutOpts{Size: size, ModTime: mtime}); err != nil {
+	var src store.Source = store.Once(r)
+	if rs, ok := r.(io.ReadSeeker); ok {
+		if ss, err := store.Seekable(rs); err == nil {
+			src = ss // a seekable stream can be uploaded again after a transient failure
+		}
+	}
+	if err := v.st.Put(ctx, p, src, store.PutOpts{Size: size, ModTime: mtime}); err != nil {
 		v.dc.cacheDel(p)
 		return Entry{}, err
 	}

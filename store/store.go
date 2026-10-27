@@ -129,3 +129,26 @@ func File(path string) Source { return fileSource(path) }
 
 func (s fileSource) Open() (io.ReadCloser, error) { return os.Open(string(s)) }
 func (s fileSource) Replayable() bool             { return true }
+
+type seekSource struct {
+	rs    io.ReadSeeker
+	start int64
+}
+
+// Seekable wraps a seekable stream as a replayable source: every Open starts
+// again at the position the stream had when it was wrapped.
+func Seekable(rs io.ReadSeeker) (Source, error) {
+	start, err := rs.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return nil, err
+	}
+	return &seekSource{rs, start}, nil
+}
+
+func (s *seekSource) Open() (io.ReadCloser, error) {
+	if _, err := s.rs.Seek(s.start, io.SeekStart); err != nil {
+		return nil, err
+	}
+	return io.NopCloser(s.rs), nil
+}
+func (s *seekSource) Replayable() bool { return true }

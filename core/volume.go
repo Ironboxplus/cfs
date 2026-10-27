@@ -84,6 +84,7 @@ type Volume struct {
 	mc      *memCache
 	segsNew atomic.Int64 // segments committed since the last checkpoint
 	ckptRun atomic.Bool
+	ckptOne sync.Mutex // one Checkpoint at a time
 
 	leaseMu sync.Mutex
 }

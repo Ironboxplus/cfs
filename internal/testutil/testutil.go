@@ -13,6 +13,7 @@ import (
 	"github.com/Ironboxplus/cfs/store"
 	"github.com/Ironboxplus/cfs/store/rclonestore"
 	_ "github.com/rclone/rclone/backend/local"
+	_ "github.com/rclone/rclone/backend/webdav"
 	"github.com/rclone/rclone/fs"
 )
 
@@ -44,4 +45,17 @@ func Stacked(base store.Store, o aspect.Options) (store.Store, *aspect.Meter) {
 		o.Retry.Max = 200 * time.Millisecond
 	}
 	return aspect.Stack(base, o)
+}
+
+// WebDAVStore returns a store on a real WebDAV server at url. rclone's own
+// low-level retries are off so failures reach the retry aspect of cfs.
+func WebDAVStore(t testing.TB, url string) store.Store {
+	t.Helper()
+	ctx := context.Background()
+	fs.GetConfig(ctx).LowLevelRetries = 1
+	f, err := fs.NewFs(ctx, ":webdav,url='"+url+"',vendor=other:")
+	if err != nil {
+		t.Fatalf("webdav fs %s: %v", url, err)
+	}
+	return rclonestore.New(f)
 }
