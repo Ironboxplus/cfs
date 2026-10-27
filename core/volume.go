@@ -218,6 +218,13 @@ func (v *Volume) Close(ctx context.Context) error {
 		keep(v.releaseLease(ctx))
 	}
 	v.closed.Store(true)
+	v.metaMu.Lock()
+	if v.metaQuiet != nil {
+		v.metaQuiet.Stop()
+		v.metaMax.Stop()
+		v.metaQuiet, v.metaMax = nil, nil
+	}
+	v.metaMu.Unlock()
 	v.cancel()
 	v.wg.Wait()
 	keep(v.ix.close())

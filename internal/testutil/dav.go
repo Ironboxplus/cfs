@@ -143,10 +143,10 @@ func (d *DAV) Mkcol(p string) error {
 // MkcolAll creates a directory and its parents.
 func (d *DAV) MkcolAll(p string) error {
 	p = strings.Trim(p, "/")
-	if p == "" {
+	if p == "" || p == "." {
 		return nil
 	}
-	if err := d.MkcolAll(path.Dir(p)); err != nil && path.Dir(p) != "." {
+	if err := d.MkcolAll(path.Dir(p)); err != nil {
 		return err
 	}
 	return d.Mkcol(p)

@@ -476,7 +476,7 @@ func (v *Volume) fireMeta() {
 		v.metaQuiet, v.metaMax = nil, nil
 	}
 	v.metaMu.Unlock()
-	if v.closed.Load() {
+	if v.closed.Load() || v.closing.Load() {
 		return
 	}
 	v.wg.Add(1)
