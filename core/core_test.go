@@ -315,3 +315,4 @@ func TestTransfersOverlap(t *testing.T) {
 	}
 	e.assertPeaks(1, 8)
 }
+func aspectOpts() aspect.Options { return aspect.Options{} }
