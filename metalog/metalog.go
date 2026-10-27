@@ -12,11 +12,12 @@ import (
 
 // Ops of a Record.
 const (
-	OpPut   = "put"   // a small file lives in Pack at Off..Off+CSize
-	OpDel   = "del"   // small file Path removed
-	OpMv    = "mv"    // small file Path renamed to To
-	OpDmv   = "dmv"   // directory Path (and all small files below) renamed to To
-	OpTouch = "touch" // modification time of small file Path set
+	OpPut    = "put"    // a small file lives in Pack at Off..Off+CSize
+	OpDel    = "del"    // small file Path removed
+	OpMv     = "mv"     // small file Path renamed to To
+	OpDmv    = "dmv"    // directory Path (and all small files below) renamed to To
+	OpTouch  = "touch"  // modification time of small file Path set
+	OpRmTree = "rmtree" // every small file below directory Path removed
 )
 
 // Record is one namespace change. Only small files (those kept in packs) are

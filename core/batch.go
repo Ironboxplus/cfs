@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/Ironboxplus/cfs/internal/crash"
@@ -37,7 +38,22 @@ type member struct {
 	expect     string // compaction: only apply while the path still points here
 	strayBig   bool   // a large file of the same name must be removed after commit
 	superseded bool
+	// state is memberPending until the commit takes the member along
+	// (memberLocked) or its caller gives up first (memberCancelled). Whoever
+	// moves it out of pending first wins, so a Put that returns an error because
+	// its context ended never becomes visible afterwards.
+	state atomic.Int32
+	// prev is what the path held before this member's commit, kept so that a
+	// put whose caller gave up too late can be taken back.
+	prev    fileRow
+	hadPrev bool
 }
+
+const (
+	memberPending int32 = iota
+	memberLocked
+	memberCancelled
+)
 
 type packManifest struct {
 	Pack    string           `json:"pack"`
@@ -322,7 +338,7 @@ func (v *Volume) commitInner(b *batch) error {
 	// Finish the zip: the self-describing manifest member, then the directory.
 	var live []*member
 	for _, m := range b.mem {
-		if !m.superseded {
+		if !m.superseded && m.state.CompareAndSwap(memberPending, memberLocked) {
 			live = append(live, m)
 		}
 	}
@@ -411,6 +427,11 @@ func (v *Volume) commitInner(b *batch) error {
 	})
 	if err != nil {
 		return err
+	}
+	for _, m := range live {
+		if r, ok, err := v.ix.get(m.path); err == nil {
+			m.prev, m.hadPrev = r, ok
+		}
 	}
 	seg := metalog.Segment{Epoch: v.epoch, Seq: seq, Pack: b.pack, PackBytes: size, PackSHA1: packSHA, PackN: len(live)}
 	for _, p := range pend {

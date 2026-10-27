@@ -112,6 +112,14 @@ func (g *gate) DirMove(ctx context.Context, src, dst string) error {
 	return g.Store.DirMove(ctx, src, dst)
 }
 
+func (g *gate) Purge(ctx context.Context, dir string) error {
+	if err := g.acquire(ctx, Meta); err != nil {
+		return err
+	}
+	defer g.release(Meta)
+	return g.Store.Purge(ctx, dir)
+}
+
 func (g *gate) Mkdir(ctx context.Context, dir string) error {
 	if err := g.acquire(ctx, Meta); err != nil {
 		return err

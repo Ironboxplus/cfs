@@ -276,7 +276,7 @@ func applyRecord(q queryer, r metalog.Record, seq uint64) error {
 		if r.Expect != "" && (!ok || fmt.Sprintf("%s@%d", cur.Pack, cur.Off) != r.Expect) {
 			return nil
 		}
-		if ok && cur.Seq > seq {
+		if r.Expect == "" && ok && cur.Seq > seq {
 			return nil
 		}
 		dir, name := splitPath(r.Path)
@@ -284,6 +284,12 @@ func applyRecord(q queryer, r metalog.Record, seq uint64) error {
 			r.Path, dir, name, r.Size, r.MTime, r.SHA1, r.Pack, r.Off, r.CSize, int(r.Meth), int64(seq))
 		return err
 	case metalog.OpDel:
+		if r.Expect != "" {
+			cur, ok, err := getFile(q, r.Path)
+			if err != nil || !ok || fmt.Sprintf("%s@%d", cur.Pack, cur.Off) != r.Expect {
+				return err
+			}
+		}
 		_, err := q.Exec("DELETE FROM files WHERE path=?", r.Path)
 		return err
 	case metalog.OpMv:
@@ -306,6 +312,10 @@ func applyRecord(q queryer, r metalog.Record, seq uint64) error {
 		lo, hi = underRange(r.Path)
 		_, err := q.Exec("UPDATE files SET path=?||substr(path,?), dir=CASE WHEN dir=? THEN ? ELSE ?||substr(dir,?) END WHERE path>=? AND path<?",
 			r.To, n, r.Path, r.To, r.To, n, lo, hi)
+		return err
+	case metalog.OpRmTree:
+		lo, hi := underRange(r.Path)
+		_, err := q.Exec("DELETE FROM files WHERE path>=? AND path<?", lo, hi)
 		return err
 	case metalog.OpTouch:
 		_, err := q.Exec("UPDATE files SET mtime=? WHERE path=?", r.MTime, r.Path)

@@ -134,13 +134,23 @@ func (v *Volume) catchUp(ctx context.Context) error {
 	}
 	rows.Close()
 	var top uint64
-	for _, ref := range refs {
+	for i, ref := range refs {
 		top = max(top, ref.Seq)
 		if ref.Seq <= base || known[segKeyOf(ref.Epoch, ref.Seq)] {
 			continue
 		}
 		seg, err := v.log.ReadSegment(ctx, ref)
 		if err != nil {
+			// The newest segment can be the leftover of an upload that was cut
+			// short: it was never verified, so nothing was acknowledged for it.
+			// Anywhere else an unreadable segment is real damage.
+			if i == len(refs)-1 && !errors.Is(err, store.ErrNotFound) && ctx.Err() == nil {
+				v.logf("cfs: ignoring unreadable newest log segment %s (an interrupted upload): %v", ref.Name, err)
+				if !v.ReadOnly() && !v.fenced.Load() {
+					_ = v.log.DeleteSegment(ctx, ref)
+				}
+				continue
+			}
 			return fmt.Errorf("cfs: replay %s: %w", ref.Name, err)
 		}
 		if err := v.applySegment(seg); err != nil {
@@ -226,7 +236,14 @@ func (v *Volume) recoverLocal(ctx context.Context) error {
 		if ref, ok := onDrive[key]; ok {
 			seg, err := v.log.ReadSegment(ctx, ref)
 			if err != nil {
-				return err
+				// Cut short by the crash: it was never complete, so the batch was
+				// never acknowledged. Remove the debris and give the rows back.
+				v.logf("cfs: log segment %s of an interrupted commit is unreadable, discarding it: %v", ref.Name, err)
+				if !v.ReadOnly() {
+					_ = v.log.DeleteSegment(ctx, ref)
+				}
+				v.unseal(key)
+				continue
 			}
 			err = v.ix.tx(func(tx *sql.Tx) error {
 				for _, r := range seg.Records {

@@ -269,8 +269,8 @@ func TestSurvivesReopenAndRebuild(t *testing.T) {
 		t.Fatal(err)
 	}
 	e.v = nil
-	os.RemoveAll(e.state)
-	e.state = t.TempDir()
+	removeAll(t, e.state)
+	e.newState()
 	e.open()
 	for p, d := range want {
 		if !bytes.Equal(e.read(p), d) {
@@ -330,5 +330,169 @@ func TestListAfterDirMoveKeepsSiblings(t *testing.T) {
 	}
 	if n := e.listNames("d2"); fmt.Sprint(n) != "[s1/ s4/]" {
 		t.Fatalf("after dirmove: %v", n)
+	}
+}
+
+// newState switches the environment to a fresh state directory. The volume is
+// closed before the directory is removed at the end of the test.
+func (e *env) newState() {
+	e.state = e.t.TempDir()
+	e.t.Cleanup(func() {
+		if e.v != nil {
+			e.v.Close(context.Background())
+			e.v = nil
+		}
+	})
+}
+
+// removeAll deletes a tree, retrying while Windows still holds files of a
+// process that has just died.
+func removeAll(t *testing.T, dir string) {
+	t.Helper()
+	var err error
+	for i := 0; i < 50; i++ {
+		if err = os.RemoveAll(dir); err == nil {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatalf("remove %s: %v", dir, err)
+}
+
+// Changes made on the drive behind cfs's back (a web UI, another tool) are
+// seen once the directory cache expires, as with rclone and OpenList.
+func TestExternalChangesAreSeenAfterCacheExpiry(t *testing.T) {
+	ctx := context.Background()
+	e := newEnv(t, aspect.Options{}, func(c *core.Config) { c.DirCacheTTL = 300 * time.Millisecond })
+	e.put("ext/small.txt", []byte("packed"))
+	if n := e.listNames("ext"); fmt.Sprint(n) != "[small.txt]" {
+		t.Fatalf("before: %v", n)
+	}
+	os.WriteFile(filepath.Join(e.drive, "ext", "added.bin"), []byte("dropped in from outside"), 0o644)
+	os.MkdirAll(filepath.Join(e.drive, "ext", "newdir"), 0o755)
+	time.Sleep(400 * time.Millisecond)
+	if n := e.listNames("ext"); fmt.Sprint(n) != "[added.bin newdir/ small.txt]" {
+		t.Fatalf("after outside additions: %v", n)
+	}
+	if got := e.read("ext/added.bin"); string(got) != "dropped in from outside" {
+		t.Fatalf("outside file content: %q", got)
+	}
+	os.Remove(filepath.Join(e.drive, "ext", "added.bin"))
+	time.Sleep(400 * time.Millisecond)
+	if _, err := e.v.Stat(ctx, "ext/added.bin"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("outside deletion not noticed: %v", err)
+	}
+}
+
+// Damage to a pack is never served as data, and fsck finds it.
+func TestCorruptionIsDetected(t *testing.T) {
+	ctx := context.Background()
+	e := newEnv(t, aspect.Options{}, func(c *core.Config) { c.ReadWindow = -1; c.MemberCache = -1 })
+	good := randBytes(3000)
+	e.put("c/a.dat", good)
+	goodB := randBytes(2000)
+	e.put("c/b.dat", goodB)
+	e.v.Flush(ctx)
+	packs, _ := filepath.Glob(filepath.Join(e.drive, ".cfs", "packs", "*.zip"))
+	if len(packs) == 0 {
+		t.Fatal("no pack")
+	}
+	// Flip bytes in the middle of every pack.
+	for _, p := range packs {
+		b, _ := os.ReadFile(p)
+		for i := 100; i < 140 && i < len(b); i++ {
+			b[i] ^= 0xff
+		}
+		os.WriteFile(p, b, 0o644)
+	}
+	corrupt := 0
+	for name, orig := range map[string][]byte{"c/a.dat": good, "c/b.dat": goodB} {
+		rc, err := e.v.Open(ctx, name, 0, -1)
+		if err != nil {
+			if !errors.Is(err, core.ErrCorrupt) {
+				t.Fatalf("%s: unexpected error %v", name, err)
+			}
+			corrupt++
+			continue
+		}
+		data, _ := io.ReadAll(rc)
+		rc.Close()
+		if !bytes.Equal(data, orig) {
+			t.Fatalf("%s: damaged data was served", name)
+		}
+	}
+	if corrupt == 0 {
+		t.Fatal("the damaged member was read without complaint")
+	}
+	rep, err := e.v.Fsck(ctx, core.FsckOpts{Deep: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	kinds := map[string]bool{}
+	for _, p := range rep.Problems {
+		kinds[p.Kind] = true
+	}
+	if !kinds["pack_checksum"] {
+		t.Fatalf("deep fsck must report the damaged pack, got %v", rep.Problems)
+	}
+	// A missing pack is reported too.
+	for _, p := range packs {
+		os.Remove(p)
+	}
+	rep, _ = e.v.Fsck(ctx, core.FsckOpts{})
+	found := false
+	for _, p := range rep.Problems {
+		found = found || p.Kind == "missing_pack"
+	}
+	if !found {
+		t.Fatalf("fsck must report the missing pack, got %v", rep.Problems)
+	}
+	if _, err := e.v.Open(ctx, "c/a.dat", 0, -1); err == nil {
+		t.Fatal("reading from a missing pack must fail, not return data")
+	}
+}
+
+func TestRemoveAll(t *testing.T) {
+	ctx := context.Background()
+	e := newEnv(t, aspect.Options{}, func(c *core.Config) { c.Threshold = 1 << 20 })
+	e.put("t/a/s1", []byte("small one"))
+	e.put("t/a/deep/s2", []byte("small two"))
+	e.put("t/a/deep/big.bin", randBytes(2<<20))
+	e.put("t/b/keep", []byte("keep me"))
+	e.put("t/a2/other", []byte("name prefix must not match"))
+	e.meter.Reset()
+	if err := e.v.RemoveAll(ctx, "t/a"); err != nil {
+		t.Fatal(err)
+	}
+	s := e.meter.Snapshot()
+	t.Logf("RemoveAll underlying: %s", s)
+	if s.Calls["purge"] != 1 {
+		t.Errorf("expected one purge call on the drive, saw %d", s.Calls["purge"])
+	}
+	if _, err := e.v.Stat(ctx, "t/a"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("directory still there: %v", err)
+	}
+	if string(e.read("t/b/keep")) != "keep me" || string(e.read("t/a2/other")) != "name prefix must not match" {
+		t.Fatal("neighbours damaged")
+	}
+	if err := e.v.RemoveAll(ctx, "t/a"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("second RemoveAll: %v", err)
+	}
+	// The removal is in the log: a rebuild from the drive agrees.
+	e.v.Flush(ctx)
+	e.v.Close(ctx)
+	e.v = nil
+	removeAll(t, e.state)
+	e.newState()
+	e.open()
+	if _, err := e.v.Stat(ctx, "t/a/s1"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("removed tree came back after rebuild: %v", err)
+	}
+	if n := e.listNames("t"); fmt.Sprint(n) != "[a2/ b/]" {
+		t.Fatalf("t = %v", n)
+	}
+	rep, err := e.v.Fsck(ctx, core.FsckOpts{Deep: true})
+	if err != nil || !rep.OK() {
+		t.Fatalf("fsck: %v %v", err, rep.Problems)
 	}
 }

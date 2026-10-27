@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -238,4 +239,65 @@ func TestFaultLargeUploadDropped(t *testing.T) {
 	if len(ents) != 1 {
 		t.Errorf("expected exactly one object in the directory, found %d", len(ents))
 	}
+}
+
+// A Put whose context ends must leave nothing behind, whether it was still
+// waiting for its pack to go out or the commit had already taken it along.
+func TestCancelledPutLeavesNoTrace(t *testing.T) {
+	e := newFaultEnv(t, 2)
+	ctx := context.Background()
+	old := randBytes(900)
+	if _, err := e.v.Put(ctx, "keep/a.dat", bytes.NewReader(old), int64(len(old)), time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.v.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// Holding the pack upload back makes the commit outlast the caller.
+	e.proxy.Add(testutil.Fault{Match: isPut, Kind: testutil.Delay, Wait: 600 * time.Millisecond, Count: -1})
+	for _, tc := range []struct {
+		name   string
+		path   string
+		cancel time.Duration
+		had    []byte
+	}{
+		{"before the commit starts", "keep/new1.dat", 0, nil},
+		{"while the pack is on its way", "keep/new2.dat", 250 * time.Millisecond, nil},
+		{"overwrite, while the pack is on its way", "keep/a.dat", 250 * time.Millisecond, old},
+	} {
+		cctx, cancel := context.WithCancel(ctx)
+		if tc.cancel == 0 {
+			cancel()
+		} else {
+			time.AfterFunc(tc.cancel, cancel)
+		}
+		data := randBytes(1200)
+		_, err := e.v.Put(cctx, tc.path, bytes.NewReader(data), int64(len(data)), time.Now())
+		cancel()
+		if err == nil {
+			t.Fatalf("%s: put reported success after its context ended", tc.name)
+		}
+		e.proxy.Clear()
+		if err := e.v.Flush(ctx); err != nil {
+			t.Fatal(err)
+		}
+		e.proxy.Add(testutil.Fault{Match: isPut, Kind: testutil.Delay, Wait: 600 * time.Millisecond, Count: -1})
+		rc, oerr := e.v.Open(ctx, tc.path, 0, -1)
+		if tc.had == nil {
+			if oerr == nil {
+				rc.Close()
+				t.Errorf("%s: %s exists although its put failed", tc.name, tc.path)
+			}
+			continue
+		}
+		if oerr != nil {
+			t.Fatalf("%s: %v", tc.name, oerr)
+		}
+		got, _ := io.ReadAll(rc)
+		rc.Close()
+		if !bytes.Equal(got, tc.had) {
+			t.Errorf("%s: %s changed although its put failed (%d bytes, had %d)", tc.name, tc.path, len(got), len(tc.had))
+		}
+	}
+	t.Logf("calls: %s", e.meter.Snapshot())
 }

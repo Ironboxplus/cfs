@@ -292,8 +292,8 @@ func TestModel(t *testing.T) {
 				t.Fatal(err)
 			}
 			e.v = nil
-			os.RemoveAll(e.state)
-			e.state = t.TempDir()
+			removeAll(t, e.state)
+			e.newState()
 			e.open()
 			compareAll(t, step, e.v, ref)
 			counts["rebuild"]++

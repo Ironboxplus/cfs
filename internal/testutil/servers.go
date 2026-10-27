@@ -170,7 +170,7 @@ func WebDAVServer(t testing.TB, dir string) (string, *Proc) {
 	t.Helper()
 	port := FreePort(t)
 	addr := fmt.Sprintf("127.0.0.1:%d", port)
-	p := StartCfs(t, nil, "serve", "webdav", dir, "--addr", addr, "--vfs-cache-mode", "off", "--read-only=false")
+	p := StartCfs(t, nil, "serve", "webdav", dir, "--addr", addr, "--vfs-cache-mode", "off", "--dir-cache-time", "1ms", "--read-only=false")
 	p.Addr = addr
 	WaitPort(t, addr, 20*time.Second)
 	return "http://" + addr, p
@@ -321,7 +321,7 @@ func (p *FaultProxy) handle(w http.ResponseWriter, r *http.Request) {
 			out.URL.Scheme, out.URL.Host = p.target.Scheme, p.target.Host
 			out.Host = p.target.Host
 			out.RequestURI = ""
-			if resp, err := p.client.Do(out); err == nil {
+			if resp, derr := p.client.Do(out); derr == nil {
 				io.Copy(io.Discard, resp.Body)
 				resp.Body.Close()
 			}

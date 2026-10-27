@@ -280,20 +280,34 @@ type lease struct {
 
 const leasePath = CtlDir + "/lease.json"
 
+// readLease reads the lease file. The drive may replace the file in place, so a
+// read that catches it half written is retried before it counts as an error.
 func (v *Volume) readLease(ctx context.Context) (lease, bool, error) {
-	rc, err := v.st.Open(ctx, leasePath, 0, -1)
-	if errors.Is(err, store.ErrNotFound) {
-		return lease{}, false, nil
+	var lastErr error
+	for i := 0; i < 8; i++ {
+		if i > 0 {
+			select {
+			case <-time.After(time.Duration(i) * 20 * time.Millisecond):
+			case <-ctx.Done():
+				return lease{}, false, ctx.Err()
+			}
+		}
+		rc, err := v.st.Open(ctx, leasePath, 0, -1)
+		if errors.Is(err, store.ErrNotFound) {
+			return lease{}, false, nil
+		}
+		if err != nil {
+			return lease{}, false, err
+		}
+		var l lease
+		err = json.NewDecoder(rc).Decode(&l)
+		rc.Close()
+		if err == nil {
+			return l, true, nil
+		}
+		lastErr = err
 	}
-	if err != nil {
-		return lease{}, false, err
-	}
-	defer rc.Close()
-	var l lease
-	if err := json.NewDecoder(rc).Decode(&l); err != nil {
-		return lease{}, false, fmt.Errorf("cfs: unreadable lease: %w", err)
-	}
-	return l, true, nil
+	return lease{}, false, fmt.Errorf("cfs: unreadable lease: %w", lastErr)
 }
 
 func (v *Volume) writeLease(ctx context.Context, released bool) error {

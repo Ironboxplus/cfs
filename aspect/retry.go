@@ -125,6 +125,12 @@ func (r *retry) Remove(ctx context.Context, p string) error {
 		func(e error) bool { return attempt > 1 && errors.Is(e, store.ErrNotFound) })
 }
 
+func (r *retry) Purge(ctx context.Context, dir string) error {
+	attempt := 0
+	return r.do(ctx, func() error { attempt++; return r.Store.Purge(ctx, dir) },
+		func(e error) bool { return attempt > 1 && errors.Is(e, store.ErrNotFound) })
+}
+
 func (r *retry) Rmdir(ctx context.Context, dir string) error {
 	attempt := 0
 	return r.do(ctx, func() error { attempt++; return r.Store.Rmdir(ctx, dir) },
@@ -181,7 +187,8 @@ func (r *retry) Put(ctx context.Context, p string, src store.Source, o store.Put
 		// object of the right size when its hash matches, or when the name is
 		// never reused for other content (Unique).
 		if o.Size >= 0 && !errors.Is(err, store.ErrNotSupported) {
-			if e, serr := r.Store.Stat(ctx, p); serr == nil && !e.IsDir && e.Size == o.Size {
+			e, serr := r.Store.Stat(ctx, p)
+			if serr == nil && !e.IsDir && e.Size == o.Size {
 				h := e.SHA1
 				if h == "" && o.SHA1 != "" {
 					h, _ = r.Store.Hash(ctx, p)

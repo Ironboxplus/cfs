@@ -248,6 +248,14 @@ func (s *Store) DirMove(ctx context.Context, src, dst string) error {
 	return mapErr(operations.DirMove(ctx, s.f, src, dst))
 }
 
+func (s *Store) Purge(ctx context.Context, dir string) error {
+	s.forgetTree(dir)
+	if err := operations.Purge(ctx, s.f, dir); err != nil {
+		return mapErr(err)
+	}
+	return nil
+}
+
 func (s *Store) Mkdir(ctx context.Context, dir string) error {
 	return mapErr(s.f.Mkdir(ctx, dir))
 }

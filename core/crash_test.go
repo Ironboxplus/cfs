@@ -369,7 +369,7 @@ func TestCrashPoints(t *testing.T) {
 			closeV()
 
 			// 2. Lose all local state: acknowledged puts must survive a rebuild.
-			os.RemoveAll(state)
+			removeAll(t, state)
 			v, closeV = openVol(t, drive, filepath.Join(base, "state2"), nil)
 			defer closeV()
 			m.verify(t, v, false)
@@ -403,7 +403,7 @@ func TestRandomKills(t *testing.T) {
 	}
 	// Final: rebuild from the drive alone.
 	m := buildModel(readEvents(t, events))
-	os.RemoveAll(state)
+	removeAll(t, state)
 	v, closeV := openVol(t, drive, filepath.Join(base, "state2"), nil)
 	defer closeV()
 	m.verify(t, v, false)

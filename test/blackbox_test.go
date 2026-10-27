@@ -136,6 +136,9 @@ func bigViaServe(t *testing.T, size int64) {
 	src := &streamer{seed: uint64(size) * 31, size: size}
 	want := src.sum()
 	t0 := time.Now()
+	if err := s.DAV.MkcolAll("big"); err != nil {
+		t.Fatal(err)
+	}
 	if err := s.DAV.Put("big/huge.bin", src, size); err != nil {
 		t.Fatal(err)
 	}

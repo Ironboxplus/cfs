@@ -134,6 +134,18 @@ func (v *Volume) putSmall(ctx context.Context, p string, data []byte, mtime time
 	select {
 	case <-b.done:
 	case <-ctx.Done():
+		if m.state.CompareAndSwap(memberPending, memberCancelled) {
+			return Entry{}, ctx.Err()
+		}
+		// The commit already took the file along. The caller will treat this as
+		// a failed write, so once it is through the write is taken back.
+		<-b.done
+		if b.err == nil {
+			v.undoPut(m, b.pack)
+		}
+		return Entry{}, ctx.Err()
+	}
+	if m.state.Load() == memberCancelled {
 		return Entry{}, ctx.Err()
 	}
 	if b.err != nil {
@@ -568,4 +580,85 @@ func (v *Volume) uploadMetaSeg(ctx context.Context, key string, rows []pendingRo
 	}
 	v.segsNew.Add(1)
 	return nil
+}
+
+// RemoveAll deletes a directory with everything below it: packed files by a
+// single logged record, large files and directories with as few calls to the
+// drive as it allows (one purge where it has one).
+func (v *Volume) RemoveAll(ctx context.Context, dir string) error {
+	dir, err := clean(dir)
+	if err != nil {
+		return err
+	}
+	if dir == "" || reserved(dir) {
+		return ErrReserved
+	}
+	if err := v.writable(); err != nil {
+		return err
+	}
+	v.structMu.Lock()
+	defer v.structMu.Unlock()
+	if err := v.waitConflicts(ctx, func(q string) bool { return q == dir || strings.HasPrefix(q, dir+"/") }); err != nil {
+		return err
+	}
+	e, err := v.Stat(ctx, dir)
+	if err != nil {
+		return err
+	}
+	if !e.IsDir {
+		return store.ErrNotDir
+	}
+	if any, err := v.ix.anyUnder(dir); err != nil {
+		return err
+	} else if any {
+		if err := v.localOp(metalog.Record{Op: metalog.OpRmTree, Path: dir}); err != nil {
+			return err
+		}
+	}
+	err = v.st.Purge(ctx, dir)
+	if errors.Is(err, store.ErrNotSupported) {
+		err = v.purgeStore(ctx, dir)
+	}
+	if err != nil && !isNotFound(err) {
+		return err
+	}
+	v.dc.dropTree(dir)
+	v.dc.cacheDel(dir)
+	return nil
+}
+
+func (v *Volume) purgeStore(ctx context.Context, dir string) error {
+	ents, err := v.st.List(ctx, dir)
+	if err != nil {
+		return err
+	}
+	for _, e := range ents {
+		if e.IsDir {
+			if err := v.purgeStore(ctx, e.Path); err != nil {
+				return err
+			}
+		} else if err := v.st.Remove(ctx, e.Path); err != nil && !isNotFound(err) {
+			return err
+		}
+	}
+	return v.st.Rmdir(ctx, dir)
+}
+
+// undoPut takes back a small-file write that was committed after its caller
+// had already given up (context cancelled): a caller that saw an error must not
+// find the file changed. The previous version, if any, is put back; the record
+// only applies while the path still points at the write being undone.
+func (v *Volume) undoPut(m *member, pack string) {
+	exp := fmt.Sprintf("%s@%d", pack, m.off)
+	rec := metalog.Record{Op: metalog.OpDel, Path: m.path, Expect: exp}
+	if m.hadPrev {
+		p := m.prev
+		rec = metalog.Record{Op: metalog.OpPut, Path: m.path, Size: p.Size, MTime: p.MTime, SHA1: p.SHA1,
+			Pack: p.Pack, Off: p.Off, CSize: p.CSize, Meth: p.Meth, Expect: exp}
+	}
+	if err := v.localOp(rec); err != nil {
+		v.logf("cfs: take back cancelled write of %s: %v", m.path, err)
+		return
+	}
+	v.dc.cacheDel(m.path)
 }

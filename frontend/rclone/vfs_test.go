@@ -10,6 +10,7 @@ import (
 	"path"
 	"path/filepath"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -17,6 +18,8 @@ import (
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config"
 	"github.com/rclone/rclone/fs/config/configmap"
+	rclog "github.com/rclone/rclone/fs/log"
+	"github.com/rclone/rclone/fs/rc"
 	"github.com/rclone/rclone/vfs"
 	"github.com/rclone/rclone/vfs/vfscommon"
 )
@@ -30,6 +33,10 @@ func setupVFS(t *testing.T, threshold string) (*vfs.VFS, func(string) []byte, st
 	t.Helper()
 	ctx := context.Background()
 	drive, state, cache := t.TempDir(), t.TempDir(), t.TempDir()
+	if os.Getenv("VFS_DEBUG") != "" {
+		fs.GetConfig(context.Background()).LogLevel = fs.LogLevelDebug
+		rclog.InitLogging()
+	}
 	config.SetCacheDir(cache)
 	var f fs.Fs
 	var err error
@@ -47,6 +54,10 @@ func setupVFS(t *testing.T, threshold string) (*vfs.VFS, func(string) []byte, st
 	opt := vfscommon.Opt
 	opt.CacheMode = vfscommon.CacheModeFull
 	opt.WriteBack = fs.Duration(30 * time.Millisecond)
+	// rclone 1.75 keeps closed cache items open for a grace period; a directory
+	// rename inside it makes the delayed close fail on the moved path (the same
+	// happens with the local backend), so the model test turns it off.
+	opt.HandleCaching = 0
 	opt.CachePollInterval = fs.Duration(time.Hour)
 	cur := vfs.New(ctx, f, &opt)
 	t.Cleanup(func() {
@@ -56,7 +67,7 @@ func setupVFS(t *testing.T, threshold string) (*vfs.VFS, func(string) []byte, st
 	// remount throws the VFS away (after its uploads finished) and starts a
 	// fresh one on the same remote, like unmounting and mounting again.
 	remount := func() *vfs.VFS {
-		cur.WaitForWriters(30 * time.Second)
+		settle(cur)
 		cur.Shutdown()
 		cur = vfs.New(ctx, f, &opt)
 		return cur
@@ -90,6 +101,7 @@ func TestVFSModel(t *testing.T) {
 
 func vfsModel(t *testing.T, threshold string) {
 	v, direct, _, remount := setupVFS(t, threshold)
+	vhist = nil
 	ref := vfsRef{t.TempDir()}
 	rng := rand.New(rand.NewPCG(5, 6))
 	rnd := func(n int) []byte {
@@ -137,7 +149,12 @@ func vfsModel(t *testing.T, threshold string) {
 			rel = filepath.ToSlash(rel)
 			want, _ := os.ReadFile(p)
 			if got, err := v.ReadFile(rel); err != nil || !bytes.Equal(got, want) {
-				t.Fatalf("step %d: %s via VFS differs (%v)", step, rel, err)
+				for _, h := range vhist {
+					if strings.Contains(h, rel) || strings.Contains(h, "dirrename") {
+						t.Log(h)
+					}
+				}
+				t.Fatalf("step %d: %s via VFS differs (%v): got %d bytes, want %d, on the volume %d", step, rel, err, len(got), len(want), len(direct(rel)))
 			}
 			if got := direct(rel); !bytes.Equal(got, want) {
 				t.Fatalf("step %d: %s on the volume differs: %d bytes, want %d", step, rel, len(got), len(want))
@@ -154,7 +171,10 @@ func vfsModel(t *testing.T, threshold string) {
 			for _, fi := range infos {
 				p := filepath.ToSlash(filepath.Join(dir, fi.Name()))
 				if _, err := os.Stat(ref.abs(p)); err != nil {
-					t.Fatalf("step %d: %s exists in the VFS but not in the reference", step, p)
+					for _, h := range vhist {
+						t.Log(h)
+					}
+					t.Fatalf("step %d: %s exists in the VFS but not in the reference (volume has %d bytes there)", step, p, len(direct(p)))
 				}
 				if fi.IsDir() {
 					walk(p)
@@ -291,7 +311,7 @@ func vfsModel(t *testing.T, threshold string) {
 			if _, err := os.Stat(ref.abs(dst)); err == nil {
 				break
 			}
-			v.WaitForWriters(30 * time.Second)
+			settle(v)
 			mkdirs(dst)
 			if err := v.Rename(src, dst); err != nil {
 				t.Fatalf("step %d: rename dir %s -> %s: %v", step, src, dst, err)
@@ -331,7 +351,10 @@ func vfsModel(t *testing.T, threshold string) {
 	t.Logf("ops: %v", counts)
 }
 
+var vhist []string
+
 func vtrace(t *testing.T, step int, s string) {
+	vhist = append(vhist, fmt.Sprintf("step %d: %s", step, s))
 	if os.Getenv("VFS_TRACE") != "" && step >= 0 {
 		t.Logf("step %d: %s", step, s)
 	}
@@ -377,5 +400,28 @@ func TestVFSDirRenameSiblings(t *testing.T) {
 				t.Fatalf("d2 = %v", names)
 			}
 		})
+	}
+}
+
+// settle waits until the VFS has nothing left to upload: no writers, no dirty
+// items, and an empty write-back queue, stable over a few polls (a renamed item
+// is re-queued a moment after the rename returns).
+func settle(v *vfs.VFS) {
+	quiet := 0
+	deadline := time.Now().Add(60 * time.Second)
+	for quiet < 5 && time.Now().Before(deadline) {
+		v.WaitForWriters(30 * time.Second)
+		busy := true
+		if dc, ok := v.Stats()["diskCache"].(rc.Params); ok {
+			in, _ := dc["uploadsInProgress"].(int)
+			q, _ := dc["uploadsQueued"].(int)
+			busy = in+q > 0
+		}
+		if busy {
+			quiet = 0
+		} else {
+			quiet++
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }

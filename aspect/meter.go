@@ -122,6 +122,12 @@ func (m *Meter) DirMove(ctx context.Context, src, dst string) error {
 	return m.Store.DirMove(ctx, src, dst)
 }
 
+func (m *Meter) Purge(ctx context.Context, dir string) error {
+	m.enter("purge", Meta)
+	defer m.leave(Meta)
+	return m.Store.Purge(ctx, dir)
+}
+
 func (m *Meter) Mkdir(ctx context.Context, dir string) error {
 	m.enter("mkdir", Meta)
 	defer m.leave(Meta)

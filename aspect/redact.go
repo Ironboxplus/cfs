@@ -19,8 +19,8 @@ var (
 // URL userinfo, token/password/signature query parameters, bearer headers.
 func Scrub(s string) string {
 	s = urlUserinfo.ReplaceAllString(s, "${1}***@")
-	s = secretKV.ReplaceAllString(s, "${1}${2}***")
 	s = bearer.ReplaceAllString(s, "${1} ***")
+	s = secretKV.ReplaceAllString(s, "${1}${2}***")
 	return s
 }
 
@@ -73,6 +73,7 @@ func (r redact) Move(ctx context.Context, a, b string) error {
 func (r redact) DirMove(ctx context.Context, a, b string) error {
 	return scrubErr(r.Store.DirMove(ctx, a, b))
 }
+func (r redact) Purge(ctx context.Context, d string) error { return scrubErr(r.Store.Purge(ctx, d)) }
 func (r redact) Mkdir(ctx context.Context, d string) error { return scrubErr(r.Store.Mkdir(ctx, d)) }
 func (r redact) Rmdir(ctx context.Context, d string) error { return scrubErr(r.Store.Rmdir(ctx, d)) }
 func (r redact) SetModTime(ctx context.Context, p string, t time.Time) error {

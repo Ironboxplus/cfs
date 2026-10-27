@@ -84,6 +84,9 @@ type Store interface {
 	// DirMove renames a directory with its whole subtree to a name that
 	// doesn't exist yet.
 	DirMove(ctx context.Context, src, dst string) error
+	// Purge removes a directory with everything in it, in as few calls as the
+	// drive allows. ErrNotFound if it is absent.
+	Purge(ctx context.Context, dir string) error
 	Mkdir(ctx context.Context, dir string) error
 	Rmdir(ctx context.Context, dir string) error
 	SetModTime(ctx context.Context, p string, t time.Time) error
