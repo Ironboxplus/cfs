@@ -1,0 +1,317 @@
+package core
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strconv"
+
+	"github.com/Ironboxplus/cfs/metalog"
+	"github.com/Ironboxplus/cfs/store"
+)
+
+// ErrEpochConflict is returned when the drive holds two different segments
+// with the same sequence number: two writers wrote at once. cfs reports it
+// and never merges silently.
+var ErrEpochConflict = errors.New("cfs: two segments with the same sequence number (writer conflict)")
+
+var packRE = regexp.MustCompile(`^p-(\d+)-(\d+)\.zip$`)
+
+func (v *Volume) segRefs(ctx context.Context) ([]metalog.Ref, error) {
+	refs, err := v.log.ListSegments(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for i := 1; i < len(refs); i++ {
+		if refs[i].Seq == refs[i-1].Seq {
+			return nil, fmt.Errorf("%w: seq %d in epochs %d and %d", ErrEpochConflict, refs[i].Seq, refs[i-1].Epoch, refs[i].Epoch)
+		}
+	}
+	return refs, nil
+}
+
+// fetchBaseCheckpoint puts the newest readable checkpoint of the drive in
+// place of a missing local index. With no usable checkpoint the index starts
+// empty and catchUp replays every segment.
+func (v *Volume) fetchBaseCheckpoint(ctx context.Context, dbPath string) error {
+	cks, err := v.log.ListCheckpoints(ctx)
+	if err != nil {
+		return err
+	}
+	for i := len(cks) - 1; i >= 0; i-- {
+		tmp := dbPath + ".fetch"
+		os.Remove(tmp)
+		if err := v.log.FetchCheckpoint(ctx, cks[i], tmp); err != nil {
+			v.logf("cfs: checkpoint %s unusable, trying an older one: %v", cks[i].Name, err)
+			continue
+		}
+		ix, err := openIndexFile(tmp)
+		if err == nil {
+			var n int
+			err = ix.db.QueryRow("SELECT count(*) FROM files").Scan(&n)
+			if err == nil {
+				err = ix.tx(func(tx *sql.Tx) error {
+					for _, q := range []string{
+						"DELETE FROM kv WHERE k IN ('writer_id','epoch','inited','dmv_intent')",
+						"DELETE FROM pending", "DELETE FROM inflight",
+					} {
+						if _, err := tx.Exec(q); err != nil {
+							return err
+						}
+					}
+					return kvSet(tx, "base_seq", strconv.FormatUint(cks[i].Seq, 10))
+				})
+			}
+			ix.close()
+		}
+		if err != nil {
+			v.logf("cfs: checkpoint %s unusable, trying an older one: %v", cks[i].Name, err)
+			os.Remove(tmp)
+			continue
+		}
+		for _, ext := range []string{"", "-wal", "-shm"} {
+			os.Remove(dbPath + ext)
+		}
+		return os.Rename(tmp, dbPath)
+	}
+	return nil
+}
+
+// applySegment applies a segment to the local index and records its name.
+func (v *Volume) applySegment(seg metalog.Segment) error {
+	key := segKeyOf(seg.Epoch, seg.Seq)
+	return v.ix.tx(func(tx *sql.Tx) error {
+		for _, r := range seg.Records {
+			if err := applyRecord(tx, r, seg.Seq); err != nil {
+				return fmt.Errorf("segment %s: %w", key, err)
+			}
+		}
+		if seg.Pack != "" {
+			if _, err := tx.Exec("INSERT OR REPLACE INTO packs(name,epoch,seq,bytes,sha1,members,dead_at) VALUES(?,?,?,?,?,?,0)",
+				seg.Pack, seg.Epoch, seg.Seq, seg.PackBytes, seg.PackSHA1, seg.PackN); err != nil {
+				return err
+			}
+		}
+		_, err := tx.Exec("INSERT OR IGNORE INTO segs(name) VALUES(?)", key)
+		return err
+	})
+}
+
+// catchUp applies the drive's segments this index hasn't seen, in sequence
+// order, and raises the sequence counter above everything on the drive.
+func (v *Volume) catchUp(ctx context.Context) error {
+	refs, err := v.segRefs(ctx)
+	if err != nil {
+		return err
+	}
+	base := v.ix.kvUint("base_seq")
+	known := map[string]bool{}
+	rows, err := v.ix.db.Query("SELECT name FROM segs")
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var n string
+		rows.Scan(&n)
+		known[n] = true
+	}
+	rows.Close()
+	var top uint64
+	for _, ref := range refs {
+		top = max(top, ref.Seq)
+		if ref.Seq <= base || known[segKeyOf(ref.Epoch, ref.Seq)] {
+			continue
+		}
+		seg, err := v.log.ReadSegment(ctx, ref)
+		if err != nil {
+			return fmt.Errorf("cfs: replay %s: %w", ref.Name, err)
+		}
+		if err := v.applySegment(seg); err != nil {
+			return err
+		}
+	}
+	cks, err := v.log.ListCheckpoints(ctx)
+	if err != nil {
+		return err
+	}
+	for _, c := range cks {
+		top = max(top, c.Seq)
+	}
+	if ents, err := v.st.List(ctx, CtlDir+"/packs"); err == nil {
+		for _, e := range ents {
+			if m := packRE.FindStringSubmatch(e.Name()); m != nil {
+				s, _ := strconv.ParseUint(m[2], 10, 64)
+				top = max(top, s)
+			}
+		}
+	}
+	return v.ix.raiseSeq(top)
+}
+
+// recoverLocal finishes what a crash of this process interrupted: a directory
+// move that was only half done, and log segments that were sealed locally.
+func (v *Volume) recoverLocal(ctx context.Context) error {
+	if s, ok := v.ix.kvGet("dmv_intent"); ok {
+		var rec metalog.Record
+		if err := json.Unmarshal([]byte(s), &rec); err != nil {
+			return err
+		}
+		_, dstErr := v.st.Stat(ctx, rec.To)
+		_, srcErr := v.st.Stat(ctx, rec.Path)
+		switch {
+		case dstErr == nil && errors.Is(srcErr, store.ErrNotFound): // the drive did move it
+			err := v.ix.tx(func(tx *sql.Tx) error {
+				if err := applyRecord(tx, rec, 0); err != nil {
+					return err
+				}
+				if err := addPending(tx, rec); err != nil {
+					return err
+				}
+				_, err := tx.Exec("DELETE FROM kv WHERE k='dmv_intent'")
+				return err
+			})
+			if err != nil {
+				return err
+			}
+			v.logf("cfs: completed interrupted directory move %s -> %s", rec.Path, rec.To)
+		case srcErr == nil && errors.Is(dstErr, store.ErrNotFound): // it never happened
+			if err := v.ix.tx(func(tx *sql.Tx) error { _, e := tx.Exec("DELETE FROM kv WHERE k='dmv_intent'"); return e }); err != nil {
+				return err
+			}
+		default:
+			return fmt.Errorf("cfs: interrupted directory move %s -> %s found in an unclear state (src: %v, dst: %v); run fsck",
+				rec.Path, rec.To, srcErr, dstErr)
+		}
+	}
+	refs, err := v.segRefs(ctx)
+	if err != nil {
+		return err
+	}
+	onDrive := map[string]metalog.Ref{}
+	for _, r := range refs {
+		onDrive[segKeyOf(r.Epoch, r.Seq)] = r
+	}
+	// Packs whose commit was interrupted after the segment reached the drive:
+	// the puts are applied now. Their pending rows ride in the same segment.
+	rows, err := v.ix.db.Query("SELECT name FROM inflight")
+	if err != nil {
+		return err
+	}
+	var names []string
+	for rows.Next() {
+		var n string
+		rows.Scan(&n)
+		names = append(names, n)
+	}
+	rows.Close()
+	sort.Strings(names)
+	for _, key := range names {
+		if ref, ok := onDrive[key]; ok {
+			seg, err := v.log.ReadSegment(ctx, ref)
+			if err != nil {
+				return err
+			}
+			err = v.ix.tx(func(tx *sql.Tx) error {
+				for _, r := range seg.Records {
+					if r.Op == metalog.OpPut {
+						if err := applyRecord(tx, r, seg.Seq); err != nil {
+							return err
+						}
+					}
+				}
+				if _, err := tx.Exec("INSERT OR REPLACE INTO packs(name,epoch,seq,bytes,sha1,members,dead_at) VALUES(?,?,?,?,?,?,0)",
+					seg.Pack, seg.Epoch, seg.Seq, seg.PackBytes, seg.PackSHA1, seg.PackN); err != nil {
+					return err
+				}
+				if _, err := tx.Exec("DELETE FROM pending WHERE seg=?", key); err != nil {
+					return err
+				}
+				_, err := tx.Exec("DELETE FROM inflight WHERE name=?", key)
+				return err
+			})
+			if err != nil {
+				return err
+			}
+			v.logf("cfs: recovered pack %s committed before the crash", seg.Pack)
+		} else {
+			v.unseal(key)
+		}
+	}
+	// Sealed metadata segments that did reach the drive need no more upload.
+	sealed, err := readPending(v.ix.db, "WHERE seg IS NOT NULL")
+	if err != nil {
+		return err
+	}
+	for _, p := range sealed {
+		if _, ok := onDrive[p.Seg]; ok {
+			if _, err := v.ix.db.Exec("DELETE FROM pending WHERE seg=?", p.Seg); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// Refresh applies segments written to the drive by the writer since this
+// volume last looked. A read-only volume calls it to follow the writer.
+func (v *Volume) Refresh(ctx context.Context) error {
+	if !v.ReadOnly() {
+		return nil
+	}
+	v.dc.reset()
+	return v.catchUp(ctx)
+}
+
+// Checkpoint uploads a snapshot of the index. Rebuilding then needs only that
+// snapshot and the segments after it. It waits for packs in commit, so the
+// snapshot is a consistent cut of the log.
+func (v *Volume) Checkpoint(ctx context.Context) error {
+	if err := v.writable(); err != nil {
+		return err
+	}
+	if err := v.flushMeta(ctx); err != nil {
+		return err
+	}
+	tmp := filepath.Join(v.cfg.StateDir, "spool", fmt.Sprintf("ckpt-%d.db", v.ix.kvUint("next_seq")))
+	os.Remove(tmp)
+	defer os.Remove(tmp)
+	v.structMu.Lock()
+	v.ckptMu.Lock()
+	seq := v.ix.kvUint("next_seq") - 1
+	_, err := v.ix.db.Exec("VACUUM INTO ?", tmp)
+	v.ckptMu.Unlock()
+	v.structMu.Unlock()
+	if err != nil {
+		return fmt.Errorf("cfs: snapshot index: %w", err)
+	}
+	if err := v.checkLease(ctx); err != nil {
+		return err
+	}
+	if err := v.log.PutCheckpoint(ctx, v.epoch, seq, tmp); err != nil {
+		return err
+	}
+	v.segsNew.Store(0)
+	_ = v.ix.kvSet("last_ckpt_seq", strconv.FormatUint(seq, 10))
+	_ = v.ix.kvSet("last_ckpt_at", strconv.FormatInt(nowUnix(), 10))
+	return nil
+}
+
+func (v *Volume) maybeCheckpoint() {
+	if !v.ckptRun.CompareAndSwap(false, true) {
+		return
+	}
+	v.wg.Add(1)
+	go func() {
+		defer v.wg.Done()
+		defer v.ckptRun.Store(false)
+		if err := v.Checkpoint(v.ctx); err != nil && v.ctx.Err() == nil {
+			v.logf("cfs: checkpoint: %v", err)
+		}
+	}()
+}
