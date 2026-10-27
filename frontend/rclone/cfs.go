@@ -177,10 +177,72 @@ func defaultStateDir(remote string) string {
 	return filepath.Join(base, "cfs", hex.EncodeToString(h[:6]))
 }
 
+// OptionsFrom reads the backend options from m, with the documented defaults
+// for everything m leaves out.
+func OptionsFrom(m configmap.Mapper) (*Options, error) {
+	ri, err := fs.Find("cfs")
+	if err != nil {
+		return nil, err
+	}
+	def := configmap.Simple{}
+	for i := range ri.Options {
+		def[ri.Options[i].Name] = ri.Options[i].String()
+	}
+	cm := configmap.New()
+	cm.AddGetter(m, configmap.PriorityNormal)
+	cm.AddGetter(def, configmap.PriorityDefault)
+	opt := new(Options)
+	if err := configstruct.Set(cm, opt); err != nil {
+		return nil, err
+	}
+	return opt, nil
+}
+
+// openRef opens the volume for key over under, or returns the one already
+// open, with its reference count raised. Caller holds regMu.
+func openRef(ctx context.Context, key string, under func() (fs.Fs, error), opt *Options) (*volRef, error) {
+	if ref := volumes[key]; ref != nil {
+		ref.refs++
+		return ref, nil
+	}
+	u, err := under()
+	if err != nil {
+		return nil, err
+	}
+	st, meter := aspect.Stack(rclonestore.New(u), aspect.Options{
+		Gate:  aspect.GateOpts{MetaInflight: opt.MetaInflight, Transfers: opt.Transfers},
+		Retry: aspect.RetryOpts{Attempts: opt.Retries},
+	})
+	v, err := core.Open(ctx, st, core.Config{
+		StateDir:        opt.StateDir,
+		Threshold:       int64(opt.Threshold),
+		PackMaxBytes:    int64(opt.PackMaxBytes),
+		PackMaxFiles:    opt.PackMaxFiles,
+		SealQuiet:       time.Duration(opt.SealQuiet),
+		SealMax:         time.Duration(opt.SealMax),
+		ReadChunk:       int64(opt.ReadChunk),
+		ReadWindow:      int64(opt.ReadWindow),
+		Pipeline:        opt.Transfers,
+		DirCacheTTL:     time.Duration(opt.DirCache),
+		LeaseTTL:        time.Duration(opt.LeaseTTL),
+		GCGrace:         time.Duration(opt.GCGrace),
+		CheckpointEvery: opt.CheckpointEvery,
+		Logf:            func(f string, a ...any) { fs.Logf(nil, "cfs: "+f, a...) },
+	})
+	if err != nil {
+		return nil, err
+	}
+	ref := &volRef{v: v, meter: meter, key: key, refs: 1}
+	startStats(ref)
+	registerExit()
+	volumes[key] = ref
+	return ref, nil
+}
+
 // NewFs makes an Fs of the cfs backend.
 func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, error) {
-	opt := new(Options)
-	if err := configstruct.Set(m, opt); err != nil {
+	opt, err := OptionsFrom(m)
+	if err != nil {
 		return nil, err
 	}
 	if opt.Remote == "" {
@@ -192,47 +254,84 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	if opt.StateDir == "" {
 		opt.StateDir = defaultStateDir(opt.Remote)
 	}
-	key := opt.Remote + "\x00" + opt.StateDir
 	regMu.Lock()
-	ref := volumes[key]
-	if ref == nil {
-		under, err := cache.Get(ctx, opt.Remote)
+	ref, err := openRef(ctx, opt.Remote+"\x00"+opt.StateDir, func() (fs.Fs, error) {
+		u, err := cache.Get(ctx, opt.Remote)
 		if err != nil && !errors.Is(err, fs.ErrorIsFile) {
-			regMu.Unlock()
 			return nil, fmt.Errorf("cfs: open remote %q: %w", opt.Remote, err)
 		}
-		st, meter := aspect.Stack(rclonestore.New(under), aspect.Options{
-			Gate:  aspect.GateOpts{MetaInflight: opt.MetaInflight, Transfers: opt.Transfers},
-			Retry: aspect.RetryOpts{Attempts: opt.Retries},
-		})
-		v, err := core.Open(ctx, st, core.Config{
-			StateDir:        opt.StateDir,
-			Threshold:       int64(opt.Threshold),
-			PackMaxBytes:    int64(opt.PackMaxBytes),
-			PackMaxFiles:    opt.PackMaxFiles,
-			SealQuiet:       time.Duration(opt.SealQuiet),
-			SealMax:         time.Duration(opt.SealMax),
-			ReadChunk:       int64(opt.ReadChunk),
-			ReadWindow:      int64(opt.ReadWindow),
-			Pipeline:        opt.Transfers,
-			DirCacheTTL:     time.Duration(opt.DirCache),
-			LeaseTTL:        time.Duration(opt.LeaseTTL),
-			GCGrace:         time.Duration(opt.GCGrace),
-			CheckpointEvery: opt.CheckpointEvery,
-			Logf:            func(f string, a ...any) { fs.Logf(nil, "cfs: "+f, a...) },
-		})
-		if err != nil {
-			regMu.Unlock()
-			return nil, err
-		}
-		ref = &volRef{v: v, meter: meter, key: key}
-		startStats(ref)
-		registerExit()
-		volumes[key] = ref
+		return u, nil
+	}, opt)
+	regMu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+	return newFs(ctx, ref, name, root, opt.Remote)
+}
+
+// Shared is a volume kept open for the whole process under a key, so that
+// every front end (a storage driver, a mount, a WebDAV server) works on the
+// same instance: a volume must have exactly one writer.
+type Shared struct {
+	ref  *volRef
+	once sync.Once
+}
+
+// Acquire returns a reference to the volume registered under key, opening it
+// over under (and with opt) when it is not open yet. under is called only then.
+func Acquire(ctx context.Context, key string, under func() (fs.Fs, error), opt *Options) (*Shared, error) {
+	regMu.Lock()
+	defer regMu.Unlock()
+	ref, err := openRef(ctx, key, under, opt)
+	if err != nil {
+		return nil, err
+	}
+	return &Shared{ref: ref}, nil
+}
+
+// Lookup returns another reference to the volume registered under key, or nil.
+func Lookup(key string) *Shared {
+	regMu.Lock()
+	defer regMu.Unlock()
+	ref := volumes[key]
+	if ref == nil {
+		return nil
 	}
 	ref.refs++
+	return &Shared{ref: ref}
+}
+
+func (s *Shared) Volume() *core.Volume { return s.ref.v }
+func (s *Shared) Meter() *aspect.Meter { return s.ref.meter }
+
+// NewFs returns an rclone Fs on the shared volume. Its Shutdown gives up its
+// own reference.
+func (s *Shared) NewFs(ctx context.Context, name, root string) (fs.Fs, error) {
+	regMu.Lock()
+	s.ref.refs++
 	regMu.Unlock()
-	return newFs(ctx, ref, name, root, opt.Remote)
+	return newFs(ctx, s.ref, name, root, "shared")
+}
+
+// Release gives up this reference; the last one closes the volume.
+func (s *Shared) Release(ctx context.Context) error {
+	var err error
+	s.once.Do(func() { err = releaseRef(ctx, s.ref) })
+	return err
+}
+
+func releaseRef(ctx context.Context, ref *volRef) error {
+	regMu.Lock()
+	ref.refs--
+	last := ref.refs <= 0
+	if last && ref.key != "" && volumes[ref.key] == ref {
+		delete(volumes, ref.key)
+	}
+	regMu.Unlock()
+	if last && ref.key != "" {
+		return ref.v.Close(ctx)
+	}
+	return ref.v.Flush(ctx)
 }
 
 // FromVolume wraps an already open volume (shared with another front end, e.g.
@@ -436,18 +535,7 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 func (f *Fs) Shutdown(ctx context.Context) error {
 	var err error
 	f.once.Do(func() {
-		regMu.Lock()
-		f.ref.refs--
-		last := f.ref.refs <= 0
-		if last && f.ref.key != "" {
-			delete(volumes, f.ref.key)
-		}
-		regMu.Unlock()
-		if last && f.ref.key != "" {
-			err = f.vol.Close(ctx)
-		} else {
-			err = f.vol.Flush(ctx)
-		}
+		err = releaseRef(ctx, f.ref)
 	})
 	return err
 }
