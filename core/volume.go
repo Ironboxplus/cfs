@@ -238,7 +238,6 @@ func (v *Volume) writable() error {
 // clean normalises a volume path: slash separated, no leading or trailing
 // slash, no "." or ".." elements.
 func clean(p string) (string, error) {
-	p = strings.ReplaceAll(p, "\\", "/")
 	p = strings.Trim(p, "/")
 	if p == "" {
 		return "", nil

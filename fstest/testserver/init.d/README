@@ -1,0 +1,1 @@
+rclone fstests looks for this directory; cfs needs no test servers

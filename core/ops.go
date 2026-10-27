@@ -384,7 +384,10 @@ func (v *Volume) DirMove(ctx context.Context, src, dst string) error {
 	if err := v.writable(); err != nil {
 		return err
 	}
-	if dst == src || strings.HasPrefix(dst, src+"/") {
+	if dst == src {
+		return store.ErrExists
+	}
+	if strings.HasPrefix(dst, src+"/") {
 		return fmt.Errorf("cfs: can't move %q into itself", src)
 	}
 	v.structMu.Lock()
