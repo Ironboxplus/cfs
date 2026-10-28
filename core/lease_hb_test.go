@@ -143,7 +143,20 @@ func TestLeaseDefaultTTLWritesOnce(t *testing.T) {
 // A writer cut off from the drive for longer than the TTL is replaced; when the
 // network is back its next commit is fenced and writes no segment.
 func TestSilentWriterIsFencedAfterTakeover(t *testing.T) {
-	for round := 0; round < 6; round++ {
+	stop := make(chan struct{})
+	defer close(stop)
+	for i := 0; i < 4; i++ { // a busy runner: the scheduler gets slow, as on the CI hosts
+		go func() {
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+			}
+		}()
+	}
+	for round := 0; round < 30; round++ {
 		t.Run(fmt.Sprintf("round%d", round), silentWriterRound)
 	}
 }
