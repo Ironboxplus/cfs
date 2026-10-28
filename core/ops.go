@@ -81,6 +81,24 @@ func (v *Volume) bigAt(ctx context.Context, p string) (store.Entry, bool, error)
 // A larger file is uploaded to its own path directly and Put returns when that
 // is done.
 func (v *Volume) Put(ctx context.Context, p string, r io.Reader, size int64, mtime time.Time) (Entry, error) {
+	return v.PutWith(ctx, p, r, PutOpts{Size: size, MTime: mtime})
+}
+
+// PutOpts describe the file handed to PutWith.
+type PutOpts struct {
+	// Size is the exact length of the stream, or -1 if unknown.
+	Size int64
+	// MTime is the modification time; zero means now.
+	MTime time.Time
+	// SHA1 is the hex SHA-1 of the content when the caller already knows it. It
+	// goes to the drive with a large file, which may then take the file without a
+	// transfer (rapid upload). It is not checked here.
+	SHA1 string
+}
+
+// PutWith is Put with the facts the caller knows about the file.
+func (v *Volume) PutWith(ctx context.Context, p string, r io.Reader, o PutOpts) (Entry, error) {
+	size, mtime := o.Size, o.MTime
 	p, err := clean(p)
 	if err != nil {
 		return Entry{}, err
@@ -142,7 +160,7 @@ func (v *Volume) Put(ctx context.Context, p string, r io.Reader, size int64, mti
 	if small {
 		return v.putSmall(ctx, p, head, mtime, bigExists)
 	}
-	return v.putLarge(ctx, p, r, size, mtime)
+	return v.putLarge(ctx, p, r, size, mtime, o.SHA1)
 }
 
 func (v *Volume) putSmall(ctx context.Context, p string, data []byte, mtime time.Time, stray bool) (Entry, error) {
@@ -182,7 +200,7 @@ func (v *Volume) putSmall(ctx context.Context, p string, data []byte, mtime time
 	return Entry{Path: p, Size: m.size, ModTime: time.Unix(0, m.mtime), Packed: true, SHA1: m.sha1}, nil
 }
 
-func (v *Volume) putLarge(ctx context.Context, p string, r io.Reader, size int64, mtime time.Time) (Entry, error) {
+func (v *Volume) putLarge(ctx context.Context, p string, r io.Reader, size int64, mtime time.Time, sha1 string) (Entry, error) {
 	// A small version of the name that is still staged has to be in the log
 	// before this write removes it (below).
 	if err := v.waitConflicts(ctx, func(q string) bool { return q == p }); err != nil {
@@ -209,7 +227,7 @@ func (v *Volume) putLarge(ctx context.Context, p string, r io.Reader, size int64
 			src = ss // a seekable stream can be uploaded again after a transient failure
 		}
 	}
-	if err := v.st.Put(ctx, p, src, store.PutOpts{Size: size, ModTime: mtime}); err != nil {
+	if err := v.st.Put(ctx, p, src, store.PutOpts{Size: size, ModTime: mtime, SHA1: sha1}); err != nil {
 		v.dc.cacheDel(p)
 		return Entry{}, err
 	}
