@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -65,6 +66,10 @@ type stager struct {
 	sealReq atomic.Bool
 	nextID  atomic.Int64
 	started atomic.Bool
+
+	// damaged counts staged files found missing or corrupt at start-up: files
+	// that were acknowledged and are now lost.
+	damaged atomic.Int64
 }
 
 func newStager(stateDir string) *stager {
@@ -97,6 +102,39 @@ func (v *Volume) Staged() (files int, bytes int64) {
 	v.stg.mu.Lock()
 	defer v.stg.mu.Unlock()
 	return len(v.stg.byPath), v.stg.bytes
+}
+
+// StagedDamaged reports how many acknowledged staged files were found missing
+// or corrupt (size or sha1 differs from the row) when the volume was opened.
+// Each is data loss: the acknowledged bytes cannot be committed. A non-zero
+// value must be looked at; the damaged file is kept next to the stage area as
+// <id>.dat.damaged.
+func (v *Volume) StagedDamaged() int64 { return v.stg.damaged.Load() }
+
+// stagedFileProblem checks a staged file against its row: it must exist, have
+// the recorded size and hash to the recorded sha1 (a same-size flip of bits
+// passes a size check). It returns "" when the file is good.
+func stagedFileProblem(path string, r fileRow) string {
+	st, err := os.Stat(path)
+	if err != nil {
+		return "missing: " + err.Error()
+	}
+	if st.Size() != r.Size {
+		return fmt.Sprintf("size %d on disk, %d acknowledged", st.Size(), r.Size)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return "unreadable: " + err.Error()
+	}
+	defer f.Close()
+	h := sha1.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "unreadable: " + err.Error()
+	}
+	if got := hex.EncodeToString(h.Sum(nil)); got != r.SHA1 {
+		return fmt.Sprintf("sha1 %s on disk, %s acknowledged", got, r.SHA1)
+	}
+	return ""
 }
 
 func writeFileSync(path string, data []byte) error {
@@ -157,9 +195,10 @@ func (v *Volume) stageInit() error {
 	var maxID int64
 	for _, x := range all {
 		maxID = max(maxID, x.r.Off)
-		st, err := os.Stat(s.path(x.r.Off))
-		if err != nil || st.Size() != x.r.Size {
-			v.logf("cfs: staged file %s (stage id %d) is missing or damaged on local disk (%v): dropping it", x.r.Path, x.r.Off, err)
+		if problem := stagedFileProblem(s.path(x.r.Off), x.r); problem != "" {
+			s.damaged.Add(1)
+			v.logf("cfs: ERROR: DATA LOSS: acknowledged staged file %s (stage id %d, %d bytes) is damaged on local disk (%s): it cannot be committed and is dropped; the file is kept as %s.damaged", x.r.Path, x.r.Off, x.r.Size, problem, filepath.Base(s.path(x.r.Off)))
+			os.Rename(s.path(x.r.Off), s.path(x.r.Off)+".damaged") // evidence; the stray sweep below ignores it
 			if _, derr := v.ix.db.Exec("DELETE FROM staged WHERE path=? AND id=?", x.r.Path, x.r.Off); derr != nil {
 				return derr
 			}

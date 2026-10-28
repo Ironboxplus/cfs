@@ -41,7 +41,9 @@ func startStats(ref *volRef) {
 			// Acknowledged small files that are not on the drive yet.
 			StagedFiles int
 			StagedBytes int64
-		}{ref.meter.Snapshot(), files, bytes})
+			// Acknowledged staged files found missing or corrupt at open: data loss.
+			StagedDamaged int64
+		}{ref.meter.Snapshot(), files, bytes, ref.v.StagedDamaged()})
 		if err != nil {
 			return
 		}

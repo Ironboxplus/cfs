@@ -508,3 +508,93 @@ func TestStagedConcurrentReadWrite(t *testing.T) {
 }
 
 var _ = http.MethodPut
+
+// A staged file whose bytes changed on local disk without changing its size
+// (bit rot, a bad sector, a stray writer) must not be committed to the drive as
+// if it were the acknowledged content. It is dropped loudly: an error line
+// naming the path, a counter that stats can export, and the damaged file kept
+// aside. Its neighbours replay normally.
+func TestStagedSameSizeCorruptionIsLoud(t *testing.T) {
+	ctx := context.Background()
+	e := newFaultEnv(t, 2, slowSeal)
+	e.proxy.Add(testutil.Fault{Match: isPut, Kind: testutil.Status, Code: 503, Count: -1})
+	want := map[string][]byte{}
+	for i := 0; i < 4; i++ {
+		p := fmt.Sprintf("rot/f%d", i)
+		want[p] = randBytes(400 + i)
+		if _, err := e.v.Put(ctx, p, bytes.NewReader(want[p]), int64(len(want[p])), time.Now()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := e.v.Close(ctx); err == nil {
+		t.Log("close with the drive down reported no error")
+	}
+	// Flip one byte in the middle of one staged file; the size stays the same.
+	stage := filepath.Join(e.stateDir, "stage")
+	ents, err := os.ReadDir(stage)
+	if err != nil || len(ents) != 4 {
+		t.Fatalf("want 4 staged files on disk, got %d (%v)", len(ents), err)
+	}
+	victim := filepath.Join(stage, ents[1].Name())
+	b, err := os.ReadFile(victim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b[len(b)/2] ^= 0xff
+	if err := os.WriteFile(victim, b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var lmu sync.Mutex
+	var logs []string
+
+	e.proxy.Clear()
+	st, _ := aspect.Stack(testutil.WebDAVStore(t, e.proxy.URL), aspect.Options{Retry: aspect.RetryOpts{Attempts: 3, Base: 20 * time.Millisecond, Max: 100 * time.Millisecond}})
+	cfg := testutil.FastConfig(e.stateDir)
+	cfg.Threshold = 64 << 10
+	cfg.Logf = func(format string, args ...any) {
+		lmu.Lock()
+		logs = append(logs, fmt.Sprintf(format, args...))
+		lmu.Unlock()
+	}
+	v2, err := core.Open(ctx, st, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer v2.Close(ctx)
+	if got := v2.StagedDamaged(); got != 1 {
+		t.Fatalf("StagedDamaged = %d, want 1", got)
+	}
+	lmu.Lock()
+	var loud string
+	for _, l := range logs {
+		if strings.Contains(l, "DATA LOSS") {
+			loud = l
+		}
+	}
+	lmu.Unlock()
+	if loud == "" || !strings.Contains(loud, "sha1") {
+		t.Fatalf("no loud sha1 line in the log: %q", logs)
+	}
+	if _, err := os.Stat(victim + ".damaged"); err != nil {
+		t.Fatalf("the damaged file was not kept aside: %v", err)
+	}
+	if err := v2.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	lost := 0
+	for p, d := range want {
+		got, err := readAllVol(v2, p)
+		switch {
+		case err != nil:
+			lost++
+			if !strings.Contains(loud, p) {
+				t.Fatalf("%s is gone but the log line does not name it: %s", p, loud)
+			}
+		case !bytes.Equal(got, d):
+			t.Fatalf("%s: content differs from what was acknowledged and nobody noticed", p)
+		}
+	}
+	if lost != 1 {
+		t.Fatalf("%d files lost, want exactly the 1 damaged", lost)
+	}
+}
