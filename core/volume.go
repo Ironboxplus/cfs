@@ -54,12 +54,14 @@ type Volume struct {
 	log metalog.MetaLog
 	ix  *index
 
-	writerID string
-	epoch    uint64
-	readOnly atomic.Bool
-	fenced   atomic.Bool
-	closed   atomic.Bool
-	closing  atomic.Bool
+	writerID  string
+	epoch     uint64
+	readOnly  atomic.Bool
+	fenced    atomic.Bool
+	closed    atomic.Bool
+	closing   atomic.Bool
+	closeOnce sync.Once
+	closeErr  error
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -220,11 +222,17 @@ func (v *Volume) Flush(ctx context.Context) error {
 }
 
 // Close flushes, checkpoints when there is something new, releases the lease
-// and closes the local index.
+// and closes the local index. It runs once; a call that comes while another is
+// at work waits for it and returns its result (as sync.Once.Do does), so a
+// process that closes from two places at exit does not leave before the lease
+// is released.
 func (v *Volume) Close(ctx context.Context) error {
-	if !v.closing.CompareAndSwap(false, true) {
-		return nil
-	}
+	v.closeOnce.Do(func() { v.closeErr = v.close(ctx) })
+	return v.closeErr
+}
+
+func (v *Volume) close(ctx context.Context) error {
+	v.closing.Store(true)
 	var first error
 	keep := func(err error) {
 		if err != nil && first == nil {
