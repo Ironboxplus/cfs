@@ -165,6 +165,9 @@ func Open(ctx context.Context, st store.Store, cfg Config) (*Volume, error) {
 	if err := v.takeLease(ctx); err != nil {
 		return fail(err)
 	}
+	if err := v.loadDirs(ctx); err != nil {
+		return fail(err)
+	}
 	if err := v.recoverLocal(ctx); err != nil {
 		return fail(err)
 	}
@@ -470,11 +473,10 @@ type dirEnt struct {
 }
 
 type dirCache struct {
-	mu    sync.Mutex
-	ttl   time.Duration
-	m     map[string]*dirEnt
-	known map[string]time.Time // directories seen to exist on the drive
-	sf    map[string]*dirFlight
+	mu  sync.Mutex
+	ttl time.Duration
+	m   map[string]*dirEnt
+	sf  map[string]*dirFlight
 }
 
 type dirFlight struct {
@@ -484,25 +486,21 @@ type dirFlight struct {
 }
 
 func newDirCache(ttl time.Duration) *dirCache {
-	return &dirCache{ttl: ttl, m: map[string]*dirEnt{}, known: map[string]time.Time{}, sf: map[string]*dirFlight{}}
+	return &dirCache{ttl: ttl, m: map[string]*dirEnt{}, sf: map[string]*dirFlight{}}
 }
 
-func (c *dirCache) isKnown(dir string) bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	t, ok := c.known[dir]
-	return ok && time.Since(t) < c.ttl
-}
+// onDrive says whether the drive may have a folder dir. Folders are only made
+// for large files, and the index records every one of them (ddirs); a read-only
+// volume doesn't know what its writer made since it looked, so it asks.
+func (v *Volume) onDrive(dir string) bool { return v.ReadOnly() || v.ix.hasDDir(dir) }
 
-func (c *dirCache) markKnown(dir string) {
-	c.mu.Lock()
-	c.known[dir] = time.Now()
-	c.mu.Unlock()
-}
-
-// listStore lists dir on the drive through the cache. The returned map must
+// listStore lists dir on the drive through the cache. A folder that isn't
+// recorded as existing is not asked about: it is absent. The returned map must
 // not be modified.
 func (v *Volume) listStore(ctx context.Context, dir string) (map[string]store.Entry, error) {
+	if !v.onDrive(dir) {
+		return nil, store.ErrNotFound
+	}
 	c := v.dc
 	c.mu.Lock()
 	if e, ok := c.m[dir]; ok && time.Since(e.at) < c.ttl {
@@ -536,16 +534,31 @@ func (v *Volume) listStore(ctx context.Context, dir string) (map[string]store.En
 	delete(c.sf, dir)
 	if err == nil {
 		c.m[dir] = &dirEnt{at: time.Now(), ents: m}
-		c.known[dir] = time.Now()
-		for _, e := range ents {
-			if e.IsDir {
-				c.known[e.Path] = time.Now()
-			}
-		}
 	} else if errors.Is(err, store.ErrNotFound) {
 		c.m[dir] = &dirEnt{at: time.Now(), absent: true}
 	}
 	c.mu.Unlock()
+	if !v.ReadOnly() {
+		switch {
+		case err == nil:
+			// What the drive lists is there: remember its folders.
+			var subs []string
+			for _, e := range ents {
+				if e.IsDir && !(dir == "" && strings.HasPrefix(e.Name(), ".cfs")) {
+					subs = append(subs, e.Path)
+				}
+			}
+			if err := v.ix.addDDirs(subs...); err != nil {
+				v.logf("cfs: record folders of %q: %v", dir, err)
+			}
+		case errors.Is(err, store.ErrNotFound):
+			// The record said the folder exists and it doesn't (a crash between the
+			// removal on the drive and the record): correct the record.
+			if err := v.ix.tx(func(tx *sql.Tx) error { return dropDDirs(tx, dir) }); err != nil {
+				v.logf("cfs: forget folder %q: %v", dir, err)
+			}
+		}
+	}
 	f.ents, f.err = m, err
 	close(f.done)
 	return m, err
@@ -564,9 +577,6 @@ func (c *dirCache) cacheAdd(e store.Entry) {
 		}
 		n[name] = e
 		c.m[dir] = &dirEnt{at: d.at, ents: n}
-	}
-	if e.IsDir {
-		c.known[e.Path] = time.Now()
 	}
 }
 
@@ -590,7 +600,6 @@ func (c *dirCache) cacheDel(p string) {
 func (c *dirCache) reset() {
 	c.mu.Lock()
 	c.m = map[string]*dirEnt{}
-	c.known = map[string]time.Time{}
 	c.mu.Unlock()
 }
 
@@ -603,16 +612,13 @@ func (c *dirCache) dropTree(p string) {
 			delete(c.m, k)
 		}
 	}
-	for k := range c.known {
-		if k == p || strings.HasPrefix(k, p+"/") {
-			delete(c.known, k)
-		}
-	}
 }
 
-// mkdirAll makes sure dir and its ancestors exist on the drive.
+// mkdirAll makes sure dir and its ancestors exist as folders on the drive, and
+// records them. It is for large files only: the other directories of the
+// namespace live in the index.
 func (v *Volume) mkdirAll(ctx context.Context, dir string) error {
-	if dir == "" || v.dc.isKnown(dir) {
+	if dir == "" || v.ix.hasDDir(dir) {
 		return nil
 	}
 	if p := parentOf(dir); p != "" {
@@ -623,8 +629,10 @@ func (v *Volume) mkdirAll(ctx context.Context, dir string) error {
 	if err := v.st.Mkdir(ctx, dir); err != nil && !errors.Is(err, store.ErrExists) {
 		return err
 	}
+	if err := v.ix.addDDirs(dir); err != nil {
+		return err
+	}
 	v.dc.cacheAdd(store.Entry{Path: dir, IsDir: true, ModTime: time.Now()})
-	v.dc.markKnown(dir)
 	v.dc.nowExists(dir)
 	return nil
 }
@@ -637,6 +645,15 @@ func (v *Volume) rowEntry(r fileRow) Entry {
 
 func bigEntry(e store.Entry) Entry {
 	return Entry{Path: e.Path, IsDir: e.IsDir, Size: e.Size, ModTime: e.ModTime, SHA1: e.SHA1}
+}
+
+// dirEntry is the entry of a directory kept in the index; mtime 0: not known.
+func dirEntry(p string, mtime int64) Entry {
+	mt := time.Now()
+	if mtime != 0 {
+		mt = time.Unix(0, mtime)
+	}
+	return Entry{Path: p, IsDir: true, ModTime: mt}
 }
 
 // Stat returns the file or directory at p.
@@ -656,6 +673,14 @@ func (v *Volume) Stat(ctx context.Context, p string) (Entry, error) {
 	} else if ok {
 		return v.rowEntry(r), nil
 	}
+	if mt, ok, err := v.ix.dirMTime(p); err != nil {
+		return Entry{}, err
+	} else if ok {
+		return dirEntry(p, mt), nil
+	}
+	if v.ix.hasDDir(p) {
+		return dirEntry(p, 0), nil
+	}
 	dir, name := splitPath(p)
 	ents, err := v.listStore(ctx, dir)
 	if err == nil {
@@ -669,13 +694,13 @@ func (v *Volume) Stat(ctx context.Context, p string) (Entry, error) {
 	if any, err := v.ix.anyStagedUnder(p); err != nil {
 		return Entry{}, err
 	} else if any {
-		return Entry{Path: p, IsDir: true, ModTime: time.Now()}, nil
+		return dirEntry(p, 0), nil
 	}
 	return Entry{}, store.ErrNotFound
 }
 
-// List returns the children of dir: directories and large files from the
-// drive's listing, small files from the index.
+// List returns the children of dir: large files from the drive's listing
+// (only for folders the drive has), small files and directories from the index.
 func (v *Volume) List(ctx context.Context, dir string) ([]Entry, error) {
 	dir, err := clean(dir)
 	if err != nil {
@@ -696,19 +721,35 @@ func (v *Volume) List(ctx context.Context, dir string) ([]Entry, error) {
 	if err != nil {
 		return nil, err
 	}
-	if lerr != nil && len(rows) == 0 && len(sdirs) == 0 && dir != "" {
-		return nil, store.ErrNotFound
+	cdirs, err := v.ix.childDirs(dir)
+	if err != nil {
+		return nil, err
 	}
-	out := make([]Entry, 0, len(ents)+len(rows)+len(sdirs))
+	if lerr != nil && len(rows) == 0 && len(sdirs) == 0 && len(cdirs) == 0 && dir != "" {
+		// Nothing in it: it still exists if it was made (Mkdir) or is a folder.
+		if isDir, err := v.ix.isDir(dir); err != nil {
+			return nil, err
+		} else if !isDir {
+			return nil, store.ErrNotFound
+		}
+	}
+	out := make([]Entry, 0, len(ents)+len(rows)+len(sdirs)+len(cdirs))
 	small := make(map[string]bool, len(rows))
 	for _, r := range rows {
 		small[r.Name] = true
 		out = append(out, v.rowEntry(r))
 	}
+	for _, d := range cdirs {
+		_, name := splitPath(d.Path)
+		if !small[name] {
+			small[name] = true
+			out = append(out, dirEntry(d.Path, d.MTime))
+		}
+	}
 	for _, name := range sdirs {
 		if _, ok := ents[name]; !ok && !small[name] {
 			small[name] = true
-			out = append(out, Entry{Path: path.Join(dir, name), IsDir: true, ModTime: time.Now()})
+			out = append(out, dirEntry(path.Join(dir, name), 0))
 		}
 	}
 	for name, e := range ents {
@@ -745,7 +786,8 @@ func (v *Volume) Hash(ctx context.Context, p string) (string, error) {
 	return v.st.Hash(ctx, p)
 }
 
-// Mkdir creates a directory (and missing parents) on the drive.
+// Mkdir creates a directory (and missing parents). It is recorded in the index
+// and the log; the drive gets a folder only when a large file needs one.
 func (v *Volume) Mkdir(ctx context.Context, dir string) error {
 	dir, err := clean(dir)
 	if err != nil {
@@ -760,10 +802,25 @@ func (v *Volume) Mkdir(ctx context.Context, dir string) error {
 	if err := v.writable(); err != nil {
 		return err
 	}
-	if _, ok, _ := v.ix.get(dir); ok {
+	v.structMu.RLock()
+	defer v.structMu.RUnlock()
+	if _, ok, err := v.ix.get(dir); err != nil {
+		return err
+	} else if ok {
 		return store.ErrExists
 	}
-	return v.mkdirAll(ctx, dir)
+	if err := v.checkAncestors(ctx, dir); err != nil {
+		return err
+	}
+	if big, ok, err := v.bigAt(ctx, dir); err != nil {
+		return err
+	} else if ok && !big.IsDir {
+		return store.ErrExists
+	}
+	if isDir, err := v.ix.isDir(dir); err != nil || isDir {
+		return err
+	}
+	return v.localOp(metalog.Record{Op: metalog.OpMkdir, Path: dir, MTime: time.Now().UnixNano()})
 }
 
 // Rmdir removes an empty directory.
@@ -787,8 +844,20 @@ func (v *Volume) Rmdir(ctx context.Context, dir string) error {
 	if len(ents) > 0 {
 		return store.ErrNotEmpty
 	}
-	if err := v.st.Rmdir(ctx, dir); err != nil {
+	if v.ix.hasDDir(dir) {
+		if err := v.st.Rmdir(ctx, dir); err != nil && !isNotFound(err) {
+			return err
+		}
+		if err := v.ix.tx(func(tx *sql.Tx) error { return dropDDirs(tx, dir) }); err != nil {
+			return err
+		}
+	}
+	if _, ok, err := v.ix.dirMTime(dir); err != nil {
 		return err
+	} else if ok {
+		if err := v.localOp(metalog.Record{Op: metalog.OpRmdir, Path: dir}); err != nil {
+			return err
+		}
 	}
 	v.dc.dropTree(dir)
 	v.dc.cacheDel(dir)
@@ -802,12 +871,12 @@ func isNotFound(err error) bool { return errors.Is(err, store.ErrNotFound) }
 var _ = path.Join
 var _ = sql.ErrNoRows
 
-// nowExists turns a cached "no such directory" into an empty directory, after
-// it has been created.
+// nowExists makes the cached listing of a folder this volume has just created
+// an empty one: the folder wasn't recorded, so nothing was in it.
 func (c *dirCache) nowExists(dir string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if d, ok := c.m[dir]; ok && d.absent {
+	if d, ok := c.m[dir]; !ok || d.absent {
 		c.m[dir] = &dirEnt{at: time.Now(), ents: map[string]store.Entry{}}
 	}
 }

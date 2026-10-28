@@ -366,18 +366,20 @@ func removeAll(t *testing.T, dir string) {
 // seen once the directory cache expires, as with rclone and OpenList.
 func TestExternalChangesAreSeenAfterCacheExpiry(t *testing.T) {
 	ctx := context.Background()
-	e := newEnv(t, aspect.Options{}, func(c *core.Config) { c.DirCacheTTL = 300 * time.Millisecond })
+	e := newEnv(t, aspect.Options{}, func(c *core.Config) { c.DirCacheTTL = 300 * time.Millisecond; c.Threshold = 1 << 20 })
 	e.put("ext/small.txt", []byte("packed"))
-	if n := e.listNames("ext"); fmt.Sprint(n) != "[small.txt]" {
+	// Outside changes are seen in the folders cfs knows: those a large file made.
+	e.put("ext/kept.bin", randBytes(2<<20))
+	if n := e.listNames("ext"); fmt.Sprint(n) != "[kept.bin small.txt]" {
 		t.Fatalf("before: %v", n)
 	}
-	if err := e.v.Flush(ctx); err != nil { // the packed file's directory exists on the drive
+	if err := e.v.Flush(ctx); err != nil {
 		t.Fatal(err)
 	}
 	os.WriteFile(filepath.Join(e.drive, "ext", "added.bin"), []byte("dropped in from outside"), 0o644)
 	os.MkdirAll(filepath.Join(e.drive, "ext", "newdir"), 0o755)
 	time.Sleep(400 * time.Millisecond)
-	if n := e.listNames("ext"); fmt.Sprint(n) != "[added.bin newdir/ small.txt]" {
+	if n := e.listNames("ext"); fmt.Sprint(n) != "[added.bin kept.bin newdir/ small.txt]" {
 		t.Fatalf("after outside additions: %v", n)
 	}
 	if got := e.read("ext/added.bin"); string(got) != "dropped in from outside" {

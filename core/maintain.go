@@ -385,8 +385,7 @@ func (v *Volume) Fsck(ctx context.Context, opts FsckOpts) (FsckReport, error) {
 	for d := range dirs {
 		lm, err := v.listStore(ctx, d)
 		if err != nil {
-			if isNotFound(err) {
-				add("missing_dir", d, "packed files live in a directory the drive doesn't have")
+			if isNotFound(err) { // packed files need no folder on the drive
 				continue
 			}
 			return rep, err
@@ -467,6 +466,9 @@ func (v *Volume) compareWithDrive(ctx context.Context) ([]mismatch, error) {
 	if err := sv.catchUp(ctx); err != nil {
 		return nil, err
 	}
+	if err := sx.backfillDirs(); err != nil {
+		return nil, err
+	}
 	load := func(ix *index) (map[string]fileRow, error) {
 		m := map[string]fileRow{}
 		err := ix.all(func(r fileRow) error { m[r.Path] = r; return nil })
@@ -493,6 +495,41 @@ func (v *Volume) compareWithDrive(ctx context.Context) ([]mismatch, error) {
 	for p := range drive {
 		if _, ok := live[p]; !ok {
 			out = append(out, mismatch{p, "in the log but not in the index"})
+		}
+	}
+	// The directories of the namespace.
+	loadDirs := func(ix *index) (map[string]bool, error) {
+		rows, err := ix.db.Query("SELECT path FROM dirs")
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+		m := map[string]bool{}
+		for rows.Next() {
+			var p string
+			if err := rows.Scan(&p); err != nil {
+				return nil, err
+			}
+			m[p] = true
+		}
+		return m, rows.Err()
+	}
+	ld, err := loadDirs(v.ix)
+	if err != nil {
+		return nil, err
+	}
+	dd, err := loadDirs(sx)
+	if err != nil {
+		return nil, err
+	}
+	for p := range ld {
+		if !dd[p] {
+			out = append(out, mismatch{p, "directory in the index but not in the log"})
+		}
+	}
+	for p := range dd {
+		if !ld[p] {
+			out = append(out, mismatch{p, "directory in the log but not in the index"})
 		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].path < out[j].path })

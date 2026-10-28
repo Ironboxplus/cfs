@@ -410,18 +410,6 @@ func (v *Volume) commitInner(b *batch) (err error) {
 	if err := v.checkLease(ctx); err != nil {
 		return err
 	}
-	// Directories of all members must exist before the pack lands: the log
-	// says the files are there, and listings come from the drive.
-	seen := map[string]bool{}
-	for _, m := range live {
-		d := parentOf(m.path)
-		if !seen[d] {
-			seen[d] = true
-			if err := v.mkdirAll(ctx, d); err != nil {
-				return fmt.Errorf("create directory %q: %w", d, err)
-			}
-		}
-	}
 	pp := CtlDir + "/packs/" + b.pack
 	if err := v.st.Put(ctx, pp, store.File(b.spool), store.PutOpts{Size: size, SHA1: packSHA, ModTime: time.Now(), Unique: true}); err != nil {
 		return fmt.Errorf("upload pack: %w", err)

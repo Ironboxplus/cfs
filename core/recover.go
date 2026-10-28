@@ -61,8 +61,8 @@ func (v *Volume) fetchBaseCheckpoint(ctx context.Context, dbPath string) error {
 			if err == nil {
 				err = ix.tx(func(tx *sql.Tx) error {
 					for _, q := range []string{
-						"DELETE FROM kv WHERE k IN ('writer_id','epoch','inited','dmv_intent')",
-						"DELETE FROM pending", "DELETE FROM inflight", "DELETE FROM staged",
+						"DELETE FROM kv WHERE k IN ('writer_id','epoch','inited','dmv_intent','ddirs_complete')",
+						"DELETE FROM pending", "DELETE FROM inflight", "DELETE FROM staged", "DELETE FROM ddirs",
 					} {
 						if _, err := tx.Exec(q); err != nil {
 							return err
@@ -188,9 +188,19 @@ func (v *Volume) recoverLocal(ctx context.Context) error {
 		_, srcErr := v.st.Stat(ctx, rec.Path)
 		switch {
 		case dstErr == nil && errors.Is(srcErr, store.ErrNotFound): // the drive did move it
-			err := v.ix.tx(func(tx *sql.Tx) error {
+			// The folder record follows, unless this start's walk already saw the result.
+			stale, err := v.ix.anyDDirUnder(rec.Path)
+			if err != nil {
+				return err
+			}
+			err = v.ix.tx(func(tx *sql.Tx) error {
 				if err := applyRecord(tx, rec, 0); err != nil {
 					return err
+				}
+				if stale {
+					if err := moveDDirs(tx, rec.Path, rec.To); err != nil {
+						return err
+					}
 				}
 				if err := addPending(tx, rec); err != nil {
 					return err
@@ -504,4 +514,82 @@ func (v *Volume) finishInterrupted(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// loadDirs brings the directory records up to date after opening: directories
+// of the namespace for the files of an index made before they were recorded,
+// and the folders the drive has. The folder record (ddirs) is a cache of the
+// drive: it is not in the log, a checkpoint's copy of it is dropped, and a
+// missing record is rebuilt by walking the drive from the root. Volumes made
+// before directories lived in the index have a real folder for each of them, so
+// they take this walk once; on a new volume it costs one listing per folder
+// that large files made. A read-only volume asks the drive instead (onDrive).
+func (v *Volume) loadDirs(ctx context.Context) error {
+	if err := v.ix.backfillDirs(); err != nil {
+		return err
+	}
+	if v.ReadOnly() {
+		return nil
+	}
+	if _, ok := v.ix.kvGet("ddirs_complete"); ok {
+		return nil
+	}
+	if err := v.ix.tx(func(tx *sql.Tx) error { _, err := tx.Exec("DELETE FROM ddirs"); return err }); err != nil {
+		return err
+	}
+	if err := v.ix.addDDirs(""); err != nil {
+		return err
+	}
+	v.dc.reset()
+	todo := []string{""}
+	n := 0
+	for len(todo) > 0 {
+		dir := todo[len(todo)-1]
+		todo = todo[:len(todo)-1]
+		ents, err := v.listStore(ctx, dir)
+		if isNotFound(err) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("cfs: walk the drive's folders at %q: %w", dir, err)
+		}
+		n++
+		for _, e := range ents {
+			if e.IsDir {
+				todo = append(todo, e.Path)
+			}
+		}
+	}
+	v.logf("cfs: recorded the drive's folders (%d listed)", n)
+	return v.ix.kvSet("ddirs_complete", "1")
+}
+
+// backfillDirs records the directories of the files of an index made before
+// directories were recorded.
+func (ix *index) backfillDirs() error {
+	if _, ok := ix.kvGet("dirs_backfilled"); ok {
+		return nil
+	}
+	return ix.tx(func(tx *sql.Tx) error {
+		rows, err := tx.Query("SELECT DISTINCT dir FROM files")
+		if err != nil {
+			return err
+		}
+		var ds []string
+		for rows.Next() {
+			var d string
+			if err := rows.Scan(&d); err != nil {
+				rows.Close()
+				return err
+			}
+			ds = append(ds, d)
+		}
+		rows.Close()
+		for _, d := range ds {
+			if err := ensureDirs(tx, d, 0); err != nil {
+				return err
+			}
+		}
+		return kvSet(tx, "dirs_backfilled", "1")
+	})
 }

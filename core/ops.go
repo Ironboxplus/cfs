@@ -18,19 +18,42 @@ import (
 	"github.com/Ironboxplus/cfs/store"
 )
 
-// checkShape rejects a file at p when an ancestor is a packed file or p is a
-// directory that holds packed files.
-func (v *Volume) checkShape(p string) error {
+// checkAncestors rejects p when one of its ancestors is a file, packed or large.
+func (v *Volume) checkAncestors(ctx context.Context, p string) error {
 	for d := parentOf(p); d != ""; d = parentOf(d) {
 		if _, ok, err := v.ix.get(d); err != nil {
 			return err
 		} else if ok {
 			return store.ErrNotDir
 		}
+		if isDir, err := v.ix.isDir(d); err != nil {
+			return err
+		} else if isDir {
+			return nil // a directory, and so are all its ancestors
+		}
+		if big, ok, err := v.bigAt(ctx, d); err != nil {
+			return err
+		} else if ok && !big.IsDir {
+			return store.ErrNotDir
+		}
+	}
+	return nil
+}
+
+// checkShape rejects a file at p when an ancestor is a file or p is a
+// directory.
+func (v *Volume) checkShape(ctx context.Context, p string) error {
+	if err := v.checkAncestors(ctx, p); err != nil {
+		return err
 	}
 	if any, err := v.ix.anyUnder(p); err != nil {
 		return err
 	} else if any {
+		return store.ErrIsDir
+	}
+	if isDir, err := v.ix.isDir(p); err != nil {
+		return err
+	} else if isDir {
 		return store.ErrIsDir
 	}
 	return nil
@@ -74,7 +97,7 @@ func (v *Volume) Put(ctx context.Context, p string, r io.Reader, size int64, mti
 	if mtime.IsZero() {
 		mtime = time.Now()
 	}
-	if err := v.checkShape(p); err != nil {
+	if err := v.checkShape(ctx, p); err != nil {
 		return Entry{}, err
 	}
 	big, bigExists, err := v.bigAt(ctx, p)
@@ -280,6 +303,11 @@ func (v *Volume) Remove(ctx context.Context, p string) error {
 		removed = true
 	}
 	if !removed {
+		if isDir, err := v.ix.isDir(p); err != nil {
+			return err
+		} else if isDir {
+			return store.ErrIsDir
+		}
 		return store.ErrNotFound
 	}
 	return nil
@@ -310,7 +338,7 @@ func (v *Volume) Move(ctx context.Context, src, dst string) error {
 	if err := v.waitConflicts(ctx, func(q string) bool { return q == src || q == dst }); err != nil {
 		return err
 	}
-	if err := v.checkShape(dst); err != nil {
+	if err := v.checkShape(ctx, dst); err != nil {
 		return err
 	}
 	v.structMu.RLock()
@@ -329,8 +357,10 @@ func (v *Volume) Move(ctx context.Context, src, dst string) error {
 	if !srcSmall && !srcIsBig {
 		return store.ErrNotFound
 	}
-	if err := v.mkdirAll(ctx, parentOf(dst)); err != nil {
-		return err
+	if srcIsBig {
+		if err := v.mkdirAll(ctx, parentOf(dst)); err != nil {
+			return err
+		}
 	}
 	dstBig, dstIsBig, err := v.bigAt(ctx, dst)
 	if err != nil {
@@ -405,7 +435,9 @@ func (v *Volume) finishMove(ctx context.Context, in mvIntent) error {
 	if _, ok, err := v.ix.getCommitted(in.Src); err != nil {
 		return err
 	} else if ok { // a small source
-		if e, err := v.st.Stat(ctx, in.Dst); err == nil && !e.IsDir {
+		if e, ok, err := v.bigAt(ctx, in.Dst); err != nil {
+			return err
+		} else if ok && !e.IsDir {
 			if err := v.st.Remove(ctx, in.Dst); err != nil && !isNotFound(err) {
 				return err
 			}
@@ -413,7 +445,9 @@ func (v *Volume) finishMove(ctx context.Context, in mvIntent) error {
 		}
 		return v.localOp(metalog.Record{Op: metalog.OpMv, Path: in.Src, To: in.Dst})
 	}
-	if e, err := v.st.Stat(ctx, in.Src); err != nil || e.IsDir { // gone: it was done
+	if e, ok, err := v.bigAt(ctx, in.Src); err != nil {
+		return err
+	} else if !ok || e.IsDir { // gone: it was done
 		return nil
 	}
 	if _, ok, err := v.ix.getCommitted(in.Dst); err != nil {
@@ -423,10 +457,13 @@ func (v *Volume) finishMove(ctx context.Context, in mvIntent) error {
 			return err
 		}
 	}
-	if e, err := v.st.Stat(ctx, in.Dst); err == nil && !e.IsDir {
+	if e, ok, err := v.bigAt(ctx, in.Dst); err != nil {
+		return err
+	} else if ok && !e.IsDir {
 		if err := v.st.Remove(ctx, in.Dst); err != nil && !isNotFound(err) {
 			return err
 		}
+		v.dc.cacheDel(in.Dst)
 	}
 	if err := v.mkdirAll(ctx, parentOf(in.Dst)); err != nil {
 		return err
@@ -509,29 +546,42 @@ func (v *Volume) DirMove(ctx context.Context, src, dst string) error {
 	} else if !isNotFound(err) {
 		return err
 	}
-	if err := v.checkShape(dst); err != nil {
-		return err
-	}
-	if err := v.mkdirAll(ctx, parentOf(dst)); err != nil {
+	if err := v.checkShape(ctx, dst); err != nil {
 		return err
 	}
 	rec := metalog.Record{Op: metalog.OpDmv, Path: src, To: dst}
-	intent, _ := json.Marshal(rec)
-	if err := v.ix.kvSet("dmv_intent", string(intent)); err != nil {
+	// The drive only moves a folder it has: a tree of small files and empty
+	// directories exists in the index alone.
+	onDriveTree, err := v.ix.anyDDirUnder(src)
+	if err != nil {
 		return err
 	}
-	crash.Point("dirmove_intent")
-	if err := v.st.DirMove(ctx, src, dst); err != nil {
-		_ = v.ix.tx(func(tx *sql.Tx) error { _, e := tx.Exec("DELETE FROM kv WHERE k='dmv_intent'"); return e })
-		return err
+	if onDriveTree {
+		if err := v.mkdirAll(ctx, parentOf(dst)); err != nil {
+			return err
+		}
+		intent, _ := json.Marshal(rec)
+		if err := v.ix.kvSet("dmv_intent", string(intent)); err != nil {
+			return err
+		}
+		crash.Point("dirmove_intent")
+		if err := v.st.DirMove(ctx, src, dst); err != nil {
+			_ = v.ix.tx(func(tx *sql.Tx) error { _, e := tx.Exec("DELETE FROM kv WHERE k='dmv_intent'"); return e })
+			return err
+		}
+		crash.Point("dirmove_done")
 	}
-	crash.Point("dirmove_done")
 	err = v.ix.tx(func(tx *sql.Tx) error {
 		if err := applyRecord(tx, rec, 0); err != nil {
 			return err
 		}
 		if err := addPending(tx, rec); err != nil {
 			return err
+		}
+		if onDriveTree {
+			if err := moveDDirs(tx, src, dst); err != nil {
+				return err
+			}
 		}
 		_, err := tx.Exec("DELETE FROM kv WHERE k='dmv_intent'")
 		return err
@@ -542,7 +592,9 @@ func (v *Volume) DirMove(ctx context.Context, src, dst string) error {
 	v.dc.dropTree(src)
 	v.dc.dropTree(dst)
 	v.dc.cacheDel(src)
-	v.dc.cacheAdd(store.Entry{Path: dst, IsDir: true, ModTime: time.Now()})
+	if onDriveTree {
+		v.dc.cacheAdd(store.Entry{Path: dst, IsDir: true, ModTime: time.Now()})
+	}
 	v.kickMeta()
 	return nil
 }
@@ -668,19 +720,36 @@ func (v *Volume) RemoveAll(ctx context.Context, dir string) error {
 	if !e.IsDir {
 		return store.ErrNotDir
 	}
-	if any, err := v.ix.anyUnder(dir); err != nil {
+	any, err := v.ix.anyUnder(dir)
+	if err != nil {
 		return err
-	} else if any {
+	}
+	if !any {
+		if any, err = v.ix.anyDirsUnder(dir); err != nil {
+			return err
+		}
+	}
+	if !any {
+		if _, any, err = v.ix.dirMTime(dir); err != nil {
+			return err
+		}
+	}
+	if any {
 		if err := v.localOp(metalog.Record{Op: metalog.OpRmTree, Path: dir}); err != nil {
 			return err
 		}
 	}
-	err = v.st.Purge(ctx, dir)
-	if errors.Is(err, store.ErrNotSupported) {
-		err = v.purgeStore(ctx, dir)
-	}
-	if err != nil && !isNotFound(err) {
-		return err
+	if v.ix.hasDDir(dir) {
+		err = v.st.Purge(ctx, dir)
+		if errors.Is(err, store.ErrNotSupported) {
+			err = v.purgeStore(ctx, dir)
+		}
+		if err != nil && !isNotFound(err) {
+			return err
+		}
+		if err := v.ix.tx(func(tx *sql.Tx) error { return dropDDirs(tx, dir) }); err != nil {
+			return err
+		}
 	}
 	v.dc.dropTree(dir)
 	v.dc.cacheDel(dir)

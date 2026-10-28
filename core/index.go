@@ -66,6 +66,18 @@ CREATE TABLE IF NOT EXISTS staged(
   stray INTEGER NOT NULL DEFAULT 0
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS staged_dir ON staged(dir);
+-- dirs: the directories of the namespace. Every ancestor of a packed file is in
+-- here (applyRecord adds them), and so is every directory made by Mkdir; they
+-- exist whether or not the drive has a folder of that name. ddirs: the folders
+-- that really exist on the drive (only large files need one): a local cache,
+-- rebuilt by walking the drive, never logged.
+CREATE TABLE IF NOT EXISTS dirs(
+  path  TEXT PRIMARY KEY,
+  dir   TEXT NOT NULL,
+  mtime INTEGER NOT NULL
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS dirs_dir ON dirs(dir);
+CREATE TABLE IF NOT EXISTS ddirs(path TEXT PRIMARY KEY) WITHOUT ROWID;
 `
 
 func openIndex(dir string) (*index, error) {
@@ -448,7 +460,10 @@ func applyRecord(q queryer, r metalog.Record, seq uint64) error {
 		dir, name := splitPath(r.Path)
 		_, err = q.Exec("INSERT OR REPLACE INTO files("+fileCols+") VALUES(?,?,?,?,?,?,?,?,?,?,?)",
 			r.Path, dir, name, r.Size, r.MTime, r.SHA1, r.Pack, r.Off, r.CSize, int(r.Meth), int64(seq))
-		return err
+		if err != nil {
+			return err
+		}
+		return ensureDirs(q, dir, r.MTime)
 	case metalog.OpDel:
 		if r.Expect != "" {
 			cur, ok, err := getFile(q, r.Path)
@@ -468,20 +483,43 @@ func applyRecord(q queryer, r metalog.Record, seq uint64) error {
 		}
 		dir, name := splitPath(r.To)
 		_, err = q.Exec("UPDATE files SET path=?, dir=?, name=? WHERE path=?", r.To, dir, name, cur.Path)
-		return err
+		if err != nil {
+			return err
+		}
+		return ensureDirs(q, dir, 0)
 	case metalog.OpDmv:
 		lo, hi := underRange(r.To)
 		if _, err := q.Exec("DELETE FROM files WHERE path>=? AND path<?", lo, hi); err != nil {
 			return err
 		}
+		if _, err := q.Exec("DELETE FROM dirs WHERE path=? OR (path>=? AND path<?)", r.To, lo, hi); err != nil {
+			return err
+		}
 		n := utf8.RuneCountInString(r.Path) + 1
 		lo, hi = underRange(r.Path)
-		_, err := q.Exec("UPDATE files SET path=?||substr(path,?), dir=CASE WHEN dir=? THEN ? ELSE ?||substr(dir,?) END WHERE path>=? AND path<?",
-			r.To, n, r.Path, r.To, r.To, n, lo, hi)
-		return err
+		if _, err := q.Exec("UPDATE files SET path=?||substr(path,?), dir=CASE WHEN dir=? THEN ? ELSE ?||substr(dir,?) END WHERE path>=? AND path<?",
+			r.To, n, r.Path, r.To, r.To, n, lo, hi); err != nil {
+			return err
+		}
+		if _, err := q.Exec("UPDATE dirs SET path=?||substr(path,?), dir=CASE WHEN dir=? THEN ? ELSE ?||substr(dir,?) END WHERE path>=? AND path<?",
+			r.To, n, r.Path, r.To, r.To, n, lo, hi); err != nil {
+			return err
+		}
+		if _, err := q.Exec("UPDATE dirs SET path=?, dir=? WHERE path=?", r.To, parentOf(r.To), r.Path); err != nil {
+			return err
+		}
+		return ensureDirs(q, r.To, 0)
 	case metalog.OpRmTree:
 		lo, hi := underRange(r.Path)
-		_, err := q.Exec("DELETE FROM files WHERE path>=? AND path<?", lo, hi)
+		if _, err := q.Exec("DELETE FROM files WHERE path>=? AND path<?", lo, hi); err != nil {
+			return err
+		}
+		_, err := q.Exec("DELETE FROM dirs WHERE path=? OR (path>=? AND path<?)", r.Path, lo, hi)
+		return err
+	case metalog.OpMkdir:
+		return ensureDirs(q, r.Path, r.MTime)
+	case metalog.OpRmdir:
+		_, err := q.Exec("DELETE FROM dirs WHERE path=?", r.Path)
 		return err
 	case metalog.OpTouch:
 		_, err := q.Exec("UPDATE files SET mtime=? WHERE path=?", r.MTime, r.Path)
@@ -528,6 +566,126 @@ func (ix *index) anyStagedUnder(p string) (bool, error) {
 	lo, hi := underRange(p)
 	var one int
 	err := ix.db.QueryRow("SELECT 1 FROM staged WHERE path>=? AND path<? LIMIT 1", lo, hi).Scan(&one)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	return err == nil, err
+}
+
+// ensureDirs records dir and all its ancestors as directories of the namespace.
+// A row that exists is left alone.
+func ensureDirs(q queryer, dir string, mtime int64) error {
+	for d := dir; d != ""; d = parentOf(d) {
+		if _, err := q.Exec("INSERT OR IGNORE INTO dirs(path,dir,mtime) VALUES(?,?,?)", d, parentOf(d), mtime); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// dirMTime returns the creation time of a directory that has a row of its own.
+func (ix *index) dirMTime(p string) (mtime int64, ok bool, err error) {
+	err = ix.db.QueryRow("SELECT mtime FROM dirs WHERE path=?", p).Scan(&mtime)
+	if err == sql.ErrNoRows {
+		return 0, false, nil
+	}
+	return mtime, err == nil, err
+}
+
+// hasDDir: the drive has a folder p, as far as the local record knows.
+func (ix *index) hasDDir(p string) bool {
+	var one int
+	return ix.db.QueryRow("SELECT 1 FROM ddirs WHERE path=?", p).Scan(&one) == nil
+}
+
+// isDir reports whether p is a directory the index knows of: one with a row of
+// its own, or a folder of the drive. Directories that only hold staged files
+// are not included (see anyStagedUnder).
+func (ix *index) isDir(p string) (bool, error) {
+	var one int
+	err := ix.db.QueryRow("SELECT 1 FROM dirs WHERE path=? UNION ALL SELECT 1 FROM ddirs WHERE path=? LIMIT 1", p, p).Scan(&one)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	return err == nil, err
+}
+
+// anyDirsUnder: a directory row lies strictly below p.
+func (ix *index) anyDirsUnder(p string) (bool, error) {
+	lo, hi := underRange(p)
+	var one int
+	err := ix.db.QueryRow("SELECT 1 FROM dirs WHERE path>=? AND path<? LIMIT 1", lo, hi).Scan(&one)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	return err == nil, err
+}
+
+// childDirs returns the directories of the namespace that sit directly in dir.
+func (ix *index) childDirs(dir string) ([]dirRow, error) {
+	rows, err := ix.db.Query("SELECT path,mtime FROM dirs WHERE dir=?", dir)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []dirRow
+	for rows.Next() {
+		var r dirRow
+		if err := rows.Scan(&r.Path, &r.MTime); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+type dirRow struct {
+	Path  string
+	MTime int64
+}
+
+// addDDirs records folders that exist on the drive.
+func (ix *index) addDDirs(paths ...string) error {
+	if len(paths) == 0 {
+		return nil
+	}
+	return ix.tx(func(tx *sql.Tx) error {
+		for _, p := range paths {
+			if _, err := tx.Exec("INSERT OR IGNORE INTO ddirs(path) VALUES(?)", p); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+// dropDDirs forgets the folder p and everything below it.
+func dropDDirs(q queryer, p string) error {
+	lo, hi := underRange(p)
+	_, err := q.Exec("DELETE FROM ddirs WHERE path=? OR (path>=? AND path<?)", p, lo, hi)
+	return err
+}
+
+// moveDDirs renames the folder src and everything below it to dst, dropping
+// whatever was recorded at dst before.
+func moveDDirs(q queryer, src, dst string) error {
+	if err := dropDDirs(q, dst); err != nil {
+		return err
+	}
+	lo, hi := underRange(src)
+	n := utf8.RuneCountInString(src) + 1
+	if _, err := q.Exec("UPDATE ddirs SET path=?||substr(path,?) WHERE path>=? AND path<?", dst, n, lo, hi); err != nil {
+		return err
+	}
+	_, err := q.Exec("UPDATE ddirs SET path=? WHERE path=?", dst, src)
+	return err
+}
+
+// anyDDirUnder: the drive has a folder at p or below it.
+func (ix *index) anyDDirUnder(p string) (bool, error) {
+	lo, hi := underRange(p)
+	var one int
+	err := ix.db.QueryRow("SELECT 1 FROM ddirs WHERE path=? OR (path>=? AND path<?) LIMIT 1", p, lo, hi).Scan(&one)
 	if err == sql.ErrNoRows {
 		return false, nil
 	}

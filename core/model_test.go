@@ -233,7 +233,7 @@ func TestModel(t *testing.T) {
 			touched = nil
 			compareAll(t, step, e.v, ref)
 		case r < 84: // remove an empty directory
-			d := fmt.Sprintf("d%d/s%d", rng.IntN(4), rng.IntN(8))
+			d := fmt.Sprintf("d%d/%c%d", rng.IntN(4), "se"[rng.IntN(2)], rng.IntN(8))
 			if _, err := os.Stat(ref.abs(d)); err != nil {
 				break
 			}
@@ -245,6 +245,18 @@ func TestModel(t *testing.T) {
 			if rerr == nil {
 				counts["rmdir"]++
 			}
+		case r < 88: // make an empty directory, sometimes with an empty child
+			d := fmt.Sprintf("d%d/e%d", rng.IntN(4), rng.IntN(8))
+			if rng.IntN(3) == 0 {
+				d += fmt.Sprintf("/x%d", rng.IntN(3))
+			}
+			if err := e.v.Mkdir(ctx, d); err != nil {
+				t.Fatalf("step %d: mkdir %s: %v", step, d, err)
+			}
+			if err := os.MkdirAll(ref.abs(d), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			counts["mkdir"]++
 		default: // read
 			if p := existing(); p != "" {
 				got, err := readAllVol(e.v, p)

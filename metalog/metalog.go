@@ -17,10 +17,13 @@ const (
 	OpMv     = "mv"     // small file Path renamed to To
 	OpDmv    = "dmv"    // directory Path (and all small files below) renamed to To
 	OpTouch  = "touch"  // modification time of small file Path set
-	OpRmTree = "rmtree" // every small file below directory Path removed
+	OpRmTree = "rmtree" // every small file and every directory entry below directory Path (and Path itself) removed
+	OpMkdir  = "mkdir"  // directory Path (and its ancestors) exists, even with nothing in it; MTime is its creation time
+	OpRmdir  = "rmdir"  // empty directory Path removed
 )
 
-// Record is one namespace change. Only small files (those kept in packs) are
+// Record is one namespace change. Only small files (those kept in packs) and
+// the directories of the namespace (which need not exist on the drive) are
 // logged: large files are the drive's own objects at their own paths.
 type Record struct {
 	Op    string `json:"op"`
