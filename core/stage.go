@@ -464,14 +464,6 @@ func (v *Volume) packStaged(m *member) {
 	if !s.current(m) {
 		return // replaced by a newer version, or gone
 	}
-	// An older version of this name in a pack that is already on its way must
-	// be committed first, or the two could reach the log in the wrong order.
-	if err := v.waitSealedPath(v.ctx, m.path); err != nil {
-		return
-	}
-	if !s.current(m) {
-		return
-	}
 	data, err := os.ReadFile(s.path(m.id))
 	if err == nil {
 		sum := sha1.Sum(data)
@@ -520,37 +512,6 @@ func (v *Volume) dropStaged(m *member) {
 	s.broadcast()
 	s.mu.Unlock()
 	os.Remove(s.path(m.id))
-}
-
-// waitSealedPath waits for every sealed pack holding a live version of p.
-func (v *Volume) waitSealedPath(ctx context.Context, p string) error {
-	for {
-		var wait *batch
-		v.batchMu.Lock()
-		for b := range v.inflight {
-			if b == v.cur {
-				continue
-			}
-			for _, m := range b.mem {
-				if m.path == p && !m.superseded {
-					wait = b
-					break
-				}
-			}
-			if wait != nil {
-				break
-			}
-		}
-		v.batchMu.Unlock()
-		if wait == nil {
-			return nil
-		}
-		select {
-		case <-wait.done:
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-	}
 }
 
 // waitStaged forces the staged files whose path matches out to the drive and

@@ -155,6 +155,21 @@ func (v *Volume) packAdd(ctx context.Context, m *member, stored []byte, crc uint
 			v.batchMu.Unlock()
 			return nil, ErrClosed
 		}
+		// An older version of this name in a pack that is already sealed must be
+		// committed first. Checked here, under the lock that also puts the member
+		// into a pack, so no pack can seal in between and let the two commit in
+		// either order: a commit applies its records over whatever the index holds.
+		if w := v.sealedHolderLocked(m.path); w != nil {
+			v.batchMu.Unlock()
+			select {
+			case <-w.done:
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-v.ctx.Done():
+				return nil, ErrClosed
+			}
+			continue
+		}
 		if b := v.cur; b != nil {
 			if len(b.mem) > 0 && (b.bytes+int64(len(stored)) > v.cfg.PackMaxBytes || len(b.mem) >= v.cfg.PackMaxFiles) {
 				v.sealLocked(b)
@@ -207,6 +222,22 @@ func (v *Volume) packAdd(ctx context.Context, m *member, stored []byte, crc uint
 		}
 		v.batchMu.Unlock()
 	}
+}
+
+// sealedHolderLocked returns a sealed pack, still in commit, that holds a live
+// version of p. batchMu held.
+func (v *Volume) sealedHolderLocked(p string) *batch {
+	for b := range v.inflight {
+		if b == v.cur {
+			continue
+		}
+		for _, m := range b.mem {
+			if m.path == p && !m.superseded {
+				return b
+			}
+		}
+	}
+	return nil
 }
 
 func (v *Volume) sealIf(b *batch) {
