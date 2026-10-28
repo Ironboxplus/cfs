@@ -96,8 +96,9 @@ type Volume struct {
 	ckptRun atomic.Bool
 	ckptOne sync.Mutex // one Checkpoint at a time
 
-	leaseMu sync.Mutex
-	leaseAt atomic.Int64 // unix nanos of the last successful read or write of the lease
+	leaseMu   sync.Mutex   // one lease write at a time: the heartbeat and the release
+	leaseDone bool         // the lease has been released: no heartbeat writes it again; leaseMu
+	leaseAt   atomic.Int64 // unix nanos of the last successful read or write of the lease
 }
 
 func (v *Volume) logf(format string, args ...any) { v.cfg.Logf(format, args...) }
@@ -410,10 +411,17 @@ func (v *Volume) takeLease(ctx context.Context) error {
 	return v.writeLease(ctx, false)
 }
 
+// releaseLease writes the released lease. It waits for a heartbeat that is
+// writing the lease and keeps later ones from writing it: the last write of the
+// lease must be the release, or the next writer finds a live lease and opens
+// read-only.
 func (v *Volume) releaseLease(ctx context.Context) error {
 	if v.ReadOnly() || v.fenced.Load() {
 		return nil
 	}
+	v.leaseMu.Lock()
+	defer v.leaseMu.Unlock()
+	v.leaseDone = true
 	return v.writeLease(ctx, true)
 }
 
@@ -454,6 +462,10 @@ func (v *Volume) heartbeatLoop() {
 		case <-t.C:
 		}
 		v.leaseMu.Lock()
+		if v.leaseDone {
+			v.leaseMu.Unlock()
+			return
+		}
 		err := v.readCheckLease(v.ctx)
 		if err == nil {
 			err = v.writeLease(v.ctx, false)
