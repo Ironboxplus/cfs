@@ -70,7 +70,7 @@ func TestLeaseReleasedByCloseDespiteAHeartbeatInFlight(t *testing.T) {
 // exit handler) otherwise exits as soon as the second one returns, with the
 // first one in the middle of releasing the lease: the next writer finds a live
 // lease and opens read-only.
-func TestSecondCloseWaitsForTheFirst(t *testing.T) {
+func TestLeaseSecondCloseWaitsForTheFirst(t *testing.T) {
 	drive := t.TempDir()
 	pr := &probe{Store: testutil.LocalStore(t, drive)}
 	pr.putHook = func(path string, src store.Source) time.Duration {
