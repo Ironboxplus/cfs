@@ -17,7 +17,7 @@ import (
 // cfs, so a regression or a fix in the rclone checkout shows up as a result.
 func TestVFSRenameQuirks(t *testing.T) {
 	for _, backend := range []string{"local", "8Mi"} {
-		for _, wb := range []time.Duration{0, 2 * time.Second} {
+		for _, wb := range []time.Duration{0, time.Second} {
 			t.Run(fmt.Sprintf("%s/write_back=%v", backend, wb), func(t *testing.T) {
 				v, direct, drive, _ := setupVFSOpts(t, backend, func(o *vfscommon.Options) { o.WriteBack = fs.Duration(wb) })
 				onDrive := func(p string) []byte {

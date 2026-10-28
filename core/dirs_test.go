@@ -86,7 +86,11 @@ func TestLazyDirsNoDriveCalls(t *testing.T) {
 			e.meter.Reset()
 
 			var dirs []string
-			for i := 0; i < 300; i++ {
+			nDirs, nFiles := 100, 500
+			if os.Getenv("CFS_LONG") != "" {
+				nDirs, nFiles = 300, 2000
+			}
+			for i := 0; i < nDirs; i++ {
 				dirs = append(dirs, fmt.Sprintf("top%d/mid%d/leaf%d", i%10, i%30, i))
 			}
 			var wg sync.WaitGroup
@@ -104,7 +108,7 @@ func TestLazyDirsNoDriveCalls(t *testing.T) {
 					}
 				}()
 			}
-			for i := 0; i < 2000; i++ {
+			for i := 0; i < nFiles; i++ {
 				files <- i
 			}
 			close(files)
@@ -119,7 +123,7 @@ func TestLazyDirsNoDriveCalls(t *testing.T) {
 				t.Fatal(err)
 			}
 			s := e.meter.Snapshot()
-			t.Logf("%s, 2000 small files in 300 directories + %d Mkdir: underlying %s", ack, len(empties), s)
+			t.Logf("%s, %d small files in %d directories + %d Mkdir: underlying %s", ack, nFiles, nDirs, len(empties), s)
 			if s.Calls["mkdir"] != 0 || s.Calls["list"] > 5 {
 				t.Fatalf("drive calls: mkdir=%d list=%d, want 0 and <= 5", s.Calls["mkdir"], s.Calls["list"])
 			}

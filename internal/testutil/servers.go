@@ -333,3 +333,9 @@ func (p *FaultProxy) handle(w http.ResponseWriter, r *http.Request) {
 }
 
 var _ = bufio.NewReader
+
+// LogAll returns the whole output of the process.
+func (p *Proc) LogAll() string {
+	b, _ := os.ReadFile(p.log.Name())
+	return string(b)
+}

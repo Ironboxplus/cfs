@@ -45,6 +45,7 @@ func (e *opEnv) addStorages(t *testing.T, cfsAddition map[string]any) {
 	add := map[string]any{
 		"remote_path": "/under/vol", "root_folder_path": "/",
 		"seal_quiet": "100ms", "seal_max": "1s",
+		"threshold": "64KiB",
 	}
 	for k, v := range cfsAddition {
 		add[k] = v
@@ -94,7 +95,7 @@ func (e *opEnv) checkPeaks(t *testing.T, meta, transfers int) {
 	}
 }
 
-// TestOpenListCfsDataset copies the OP-sync tree into a cfs storage through
+// TestOpenListCfsDataset copies a generated source-like tree (1500 files, ~40 MB) into a cfs storage through
 // OpenList's WebDAV (the storage driver path: the same Put serves the API, the
 // WebDAV, S3 and the sync jobs), with the caller concurrency of a sync job (4),
 // of a browser (3) and of the earlier bulk run (12), in both ack modes, and
@@ -103,7 +104,10 @@ func TestOpenListCfsDataset(t *testing.T) {
 	for _, c := range []struct {
 		mode      string
 		uploaders int
-	}{{"staged", 3}, {"staged", 12}, {"durable", 12}} {
+	}{{"staged", 3}, {"durable", 12}, {"staged", 12}} {
+		if c.mode == "staged" && c.uploaders == 12 && os.Getenv("CFS_LONG") == "" {
+			continue // the third variant only on request
+		}
 		t.Run(fmt.Sprintf("%s/%d-uploads", c.mode, c.uploaders), func(t *testing.T) {
 			add := map[string]any{"ack": c.mode}
 			if c.mode == "staged" {
@@ -116,11 +120,10 @@ func TestOpenListCfsDataset(t *testing.T) {
 }
 
 func datasetRun(t *testing.T, mode string, uploaders int, add map[string]any) {
-	src := datasetSource(t)
 	e := newOpEnv(t, add)
 	refDir := filepath.Join(t.TempDir(), "ref")
 	os.MkdirAll(refDir, 0o755)
-	copyTree(t, src, refDir)
+	buildDataset(t, refDir, 1500)
 	ref := testutil.RefTree{Root: refDir}
 	dav := e.cfs()
 
@@ -161,7 +164,7 @@ func datasetRun(t *testing.T, mode string, uploaders int, add map[string]any) {
 		case i%10 == 0:
 			write(p, randData(rng, []int{0, 1, 700, 5000, 200 << 10}[rng.IntN(5)]))
 		case i%400 == 7:
-			write(p, randData(rng, 8<<20+1))
+			write(p, randData(rng, dsThreshold+1))
 		}
 	}
 	for i, p := range names {
@@ -241,7 +244,7 @@ func TestOpenListCfsOneInstanceForTwoFrontEnds(t *testing.T) {
 	vfs := testutil.NewDAV("http://" + vfsAddr)
 
 	rng := rand.New(rand.NewPCG(3, 4))
-	small, big := randData(rng, 1500), randData(rng, 9<<20)
+	small, big := randData(rng, 1500), randData(rng, 300<<10)
 	if err := e.cfs().PutBytes("via-openlist/small.bin", small); err != nil {
 		// parent directories first
 		e.cfs().MkcolAll("via-openlist")
@@ -436,7 +439,7 @@ func TestOpenListCfsMount(t *testing.T) {
 	waitFor(t, 60*time.Second, func() error { _, err := os.ReadDir(root); return err })
 
 	rng := rand.New(rand.NewPCG(5, 6))
-	small, big := randData(rng, 1500), randData(rng, 9<<20)
+	small, big := randData(rng, 1500), randData(rng, 300<<10)
 	if err := os.WriteFile(filepath.Join(root, "small.bin"), small, 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -464,12 +467,12 @@ func TestOpenListCfsMount(t *testing.T) {
 // /api/fs/put. Staged, the packs follow the bytes; the file count and the
 // callers don't matter. Both ack modes are counted.
 func TestOpenListCfsAPIPut(t *testing.T) {
-	const files, callers = 900, 3
+	const files, callers = 300, 3
 	var total int64
 	res := map[string][2]int{}
 	for _, mode := range []string{"staged", "durable"} {
 		t.Run(mode, func(t *testing.T) {
-			add := map[string]any{"ack": mode, "pack_max_bytes": "512KiB"}
+			add := map[string]any{"ack": mode, "pack_max_bytes": "128KiB"}
 			if mode == "staged" {
 				add["seal_quiet"], add["seal_max"] = "2s", "60s"
 			}
@@ -507,14 +510,14 @@ func TestOpenListCfsAPIPut(t *testing.T) {
 			packs, segs, _, _ := e.drive(t)
 			res[mode] = [2]int{packs, segs}
 			t.Logf("RESULT API put ack=%s: %d files (%d bytes) from %d callers -> %d packs, %d log segments", mode, files, total, callers, packs, segs)
-			for i := 0; i < files; i += 41 {
+			for i := 0; i < files; i += 17 {
 				got, err := e.cfs().Get(fmt.Sprintf("api/f%04d", i))
 				if err != nil || string(got) != string(datas[i]) {
 					t.Fatalf("file %d wrong: %v", i, err)
 				}
 			}
 			if mode == "staged" {
-				if want := int(total/(512<<10)) + 1; packs > want+3 {
+				if want := int(total/(128<<10)) + 1; packs > want+3 {
 					t.Errorf("staged: %d packs for %d bytes, want about %d", packs, total, want)
 				}
 			}

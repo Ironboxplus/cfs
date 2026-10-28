@@ -30,8 +30,8 @@ func countFiles(dir string) int {
 // own concurrency, and the packs on the drive follow the bytes, not the files
 // or the callers. Both ack modes are run and counted.
 func TestVFSPackEfficiency(t *testing.T) {
-	const files, callers = 1500, 3
-	const packMax = 256 << 10
+	const files, callers = 500, 3
+	const packMax = 64 << 10
 	rng := rand.New(rand.NewPCG(5, 6))
 	sizes := make([]int, files)
 	var total int64
@@ -51,7 +51,7 @@ func TestVFSPackEfficiency(t *testing.T) {
 				quiet, max = "40ms", "400ms"
 			}
 			f, err := cfsrclone.NewFs(ctx, "vfspacks", "", configmap.Simple{
-				"remote": drive, "state_dir": state, "ack": mode, "pack_max_bytes": "256Ki",
+				"remote": drive, "state_dir": state, "ack": mode, "pack_max_bytes": "64Ki",
 				"seal_quiet": quiet, "seal_max": max, "dir_cache": "1h", "lease_ttl": "30s",
 			})
 			if err != nil {

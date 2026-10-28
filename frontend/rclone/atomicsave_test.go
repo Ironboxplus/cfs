@@ -20,7 +20,7 @@ import (
 // Windows, for the plain local backend as much as for cfs.
 func TestVFSAtomicSave(t *testing.T) {
 	for _, backend := range []string{"local", "8Mi"} {
-		for _, wb := range []time.Duration{0, 5 * time.Second} {
+		for _, wb := range []time.Duration{0, time.Second} {
 			name := fmt.Sprintf("%s/write_back=%v", map[string]string{"local": "local", "8Mi": "cfs"}[backend], wb)
 			t.Run(name, func(t *testing.T) {
 				v, direct, drive, _ := setupVFSOpts(t, backend, func(o *vfscommon.Options) {

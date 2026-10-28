@@ -27,7 +27,7 @@ func TestEdgeFilesWebDAV(t *testing.T) {
 	e := newLocalEnv(t)
 	s := e.serve(t, nil)
 	rng := rand.New(rand.NewPCG(3, 4))
-	const T = 8 << 20
+	const T = 64 << 10 // the server's threshold (testutil)
 	type f struct {
 		p    string
 		size int
@@ -158,7 +158,7 @@ func bigViaServe(t *testing.T, size int64) {
 	ref := &streamer{seed: src.seed, size: size}
 	for i := 0; i < 10; i++ {
 		off := rng.Int64N(size - 1)
-		ln := int64(1 + rng.IntN(5<<20))
+		ln := int64(1 + rng.IntN(600<<10))
 		if off+ln > size {
 			ln = size - off
 		}
@@ -175,8 +175,8 @@ func bigViaServe(t *testing.T, size int64) {
 	s.Quit(t)
 }
 
-func TestBigFile32MiBWebDAVServe(t *testing.T) { bigViaServe(t, 32<<20) }
-func TestBigFile64MiBWebDAVServe(t *testing.T) { bigViaServe(t, 64<<20) }
+func TestBigFile1MiBWebDAVServe(t *testing.T) { bigViaServe(t, 1<<20) }
+func TestBigFile4MiBWebDAVServe(t *testing.T) { bigViaServe(t, 4<<20) }
 
 // ---- crashes of the whole server ----
 
@@ -189,9 +189,9 @@ func makeUploads(n int, seed uint64) []upload {
 	rng := rand.New(rand.NewPCG(seed, 11))
 	out := make([]upload, n)
 	for i := range out {
-		sz := []int{0, 20, 900, 5000, 60000, 400000}[rng.IntN(6)]
+		sz := []int{0, 20, 900, 5000, 20000, 60000}[rng.IntN(6)]
 		if i%97 == 5 {
-			sz = 8<<20 + rng.IntN(1000) // a few large ones
+			sz = 200<<10 + rng.IntN(1000) // a few large ones (above the 64 KiB threshold)
 		}
 		out[i] = upload{fmt.Sprintf("crash/d%d/file%03d.dat", i%7, i), randData(rng, sz)}
 	}
@@ -234,7 +234,10 @@ func pushAll(d *testutil.DAV, ups []upload, workers int) map[string]string {
 }
 
 func TestServerCrashKeepsAcknowledgedUploads(t *testing.T) {
-	cases := []string{"pack_uploaded:2", "pack_verified:3", "log_uploaded:2", "local_marked:2", "random"}
+	cases := []string{"pack_uploaded:2", "local_marked:2", "random"}
+	if os.Getenv("CFS_LONG") != "" { // each case costs ~8 s
+		cases = []string{"pack_uploaded:2", "pack_verified:3", "log_uploaded:2", "local_marked:2", "random"}
+	}
 	for _, cp := range cases {
 		t.Run(strings.ReplaceAll(cp, ":", "_"), func(t *testing.T) {
 			e := newLocalEnv(t)

@@ -317,7 +317,13 @@ func durable(c *core.Config) { c.Ack = core.AckDurable }
 // move to a later segment: a "remove x" replayed after a later "put x" would
 // delete the new x when the volume is rebuilt from the drive.
 func TestSegmentFailureKeepsMetadataOrder(t *testing.T) {
-	for _, mode := range ackModes {
+	// The retry back-offs make each mode take ~15 s: the default mode always, the
+	// other one when asked for (CFS_LONG, or a whole run in durable mode).
+	modes := []core.AckMode{core.AckStaged}
+	if os.Getenv("CFS_LONG") != "" || os.Getenv("CFS_TEST_ACK") == "durable" {
+		modes = ackModes
+	}
+	for _, mode := range modes {
 		t.Run(string(mode), func(t *testing.T) {
 			ctx := context.Background()
 			e := newFaultEnv(t, 2, func(c *core.Config) {

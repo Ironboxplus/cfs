@@ -20,7 +20,7 @@ type ServeOpts struct {
 	Underlying string
 	StateDir   string
 	CacheDir   string // rclone VFS cache; keep it across restarts to test replay
-	Threshold  string // default 8Mi
+	Threshold  string // default 64Ki: a few hundred KiB are "big", as rclone's chunked-upload tests shrink their chunks
 	SealQuiet  string // default 100ms
 	SealMax    string // default 1s
 	Transfers  int    // cfs transfers; default 8
@@ -44,7 +44,7 @@ type Server struct {
 func StartServe(t testing.TB, o ServeOpts) *Server {
 	t.Helper()
 	if o.Threshold == "" {
-		o.Threshold = "8Mi"
+		o.Threshold = "64Ki"
 	}
 	if o.SealQuiet == "" {
 		o.SealQuiet = "100ms"

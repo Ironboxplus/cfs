@@ -75,10 +75,13 @@ func hashStream(r io.Reader) (string, int64, error) {
 	return hex.EncodeToString(h.Sum(nil)), n, err
 }
 
-// bigVolume opens a volume on st with the default 8 MiB threshold.
+// bigVolume opens a volume on st with a 64 KiB threshold and 256 KiB read
+// chunks: a few MiB exercise what 8 MiB / GiB files would (rclone's chunked-upload
+// tests shrink their chunk sizes the same way).
 func bigVolume(t *testing.T, st store.Store, transfers int) (*core.Volume, *aspect.Meter) {
 	s, m := testutil.Stacked(st, aspect.Options{Gate: aspect.GateOpts{MetaInflight: 1, Transfers: transfers}})
 	cfg := testutil.FastConfig(t.TempDir())
+	cfg.Threshold, cfg.ReadChunk = 64<<10, 256<<10
 	v, err := core.Open(context.Background(), s, cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -129,7 +132,7 @@ func testBigFile(t *testing.T, size int64, mkStore func(t *testing.T, drive stri
 	}
 	ref := &pattern{seed: src.seed, size: size}
 	for _, off := range offs {
-		ln := int64(1 + rng.IntN(3<<20))
+		ln := int64(1 + rng.IntN(600<<10))
 		if off+ln > size {
 			ln = size - off
 		}
@@ -164,10 +167,10 @@ func davStoreFn(t *testing.T, drive string) store.Store {
 	return testutil.WebDAVStore(t, url)
 }
 
-func TestBigFile32MiBLocal(t *testing.T)  { testBigFile(t, 32<<20, localStoreFn) }
-func TestBigFile64MiBLocal(t *testing.T)  { testBigFile(t, 64<<20, localStoreFn) }
-func TestBigFile32MiBWebDAV(t *testing.T) { testBigFile(t, 32<<20, davStoreFn) }
-func TestBigFile64MiBWebDAV(t *testing.T) { testBigFile(t, 64<<20, davStoreFn) }
+func TestBigFile1MiBLocal(t *testing.T)  { testBigFile(t, 1<<20, localStoreFn) }
+func TestBigFile4MiBLocal(t *testing.T)  { testBigFile(t, 4<<20, localStoreFn) }
+func TestBigFile1MiBWebDAV(t *testing.T) { testBigFile(t, 1<<20, davStoreFn) }
+func TestBigFile4MiBWebDAV(t *testing.T) { testBigFile(t, 4<<20, davStoreFn) }
 
 // Files of exactly the threshold and one byte either side, and a file that
 // grows across it and shrinks back.
@@ -175,7 +178,7 @@ func TestThresholdEdges(t *testing.T) {
 	ctx := context.Background()
 	drive := t.TempDir()
 	v, _ := bigVolume(t, testutil.LocalStore(t, drive), 8)
-	const T = 8 << 20
+	const T = 64 << 10
 	loose := func(p string) bool {
 		_, err := os.Stat(filepath.Join(drive, filepath.FromSlash(p)))
 		return err == nil

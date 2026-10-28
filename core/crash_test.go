@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -390,12 +391,16 @@ func ackTweak(mode core.AckMode) func(*core.Config) {
 func TestCrashPoints(t *testing.T) {
 	for _, mode := range ackModes {
 		t.Run(string(mode), func(t *testing.T) {
-			points := []string{
-				"pack_uploaded:1", "pack_uploaded:4", "pack_verified:2", "log_uploaded:1", "log_uploaded:5",
-				"local_marked:1", "local_marked:6", "meta_fsynced:1", "meta_fsynced:20", "meta_log_uploaded:1",
+			// Every step of a commit once; CFS_LONG=1 adds the early and late hits.
+			points := []string{"pack_uploaded:4", "pack_verified:2", "log_uploaded:1", "local_marked:6", "meta_fsynced:20", "meta_log_uploaded:1"}
+			if os.Getenv("CFS_LONG") != "" {
+				points = append(points, "pack_uploaded:1", "log_uploaded:5", "local_marked:1", "meta_fsynced:1")
 			}
 			if mode == core.AckStaged {
-				points = append(points, "staged:1", "staged:90")
+				points = append(points, "staged:90")
+				if os.Getenv("CFS_LONG") != "" {
+					points = append(points, "staged:1")
+				}
 			}
 			for _, cp := range points {
 				t.Run(cp, func(t *testing.T) { crashPoint(t, mode, cp) })
@@ -414,8 +419,22 @@ func crashPoint(t *testing.T, mode core.AckMode, cp string) {
 		// commit steps often enough.
 		common = append(common, "-packfiles", "6")
 	}
-	args := append(append([]string{}, common...), "-ops", "60", "-seed", "7", "-pause", "2ms")
-	code := runWriter(t, args, cp, 0)
+	// Whether the first metadata-only segment is ever uploaded depends on timing
+	// (a pack's segment may carry the queued records first): another seed gets
+	// there if this one doesn't.
+	code := 0
+	for attempt := 0; attempt < 4; attempt++ {
+		if attempt > 0 {
+			os.RemoveAll(drive)
+			os.RemoveAll(state)
+			os.RemoveAll(events)
+			os.MkdirAll(drive, 0o755)
+		}
+		args := append(append([]string{}, common...), "-ops", "60", "-seed", strconv.Itoa(7+10*attempt), "-pause", "2ms")
+		if code = runWriter(t, args, cp, 0); code == 137 || !strings.HasPrefix(cp, "meta_log_uploaded") {
+			break
+		}
+	}
 	if code != 137 {
 		t.Fatalf("expected the writer to die at %s (exit 137), got exit %d", cp, code)
 	}

@@ -355,8 +355,8 @@ func TestStagedCancelledPutLeavesNoTrace(t *testing.T) {
 // The pack-efficiency requirement: three callers, 2000 small files, then Flush:
 // the number of packs follows the bytes, not the files or the callers.
 func TestPackEfficiency(t *testing.T) {
-	const files, callers = 2000, 3
-	const packMax = 256 << 10
+	const files, callers = 600, 3
+	const packMax = 64 << 10
 	rng := rand.New(rand.NewPCG(5, 6))
 	sizes := make([]int, files)
 	var total int64

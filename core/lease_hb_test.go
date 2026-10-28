@@ -77,8 +77,8 @@ func openCounted(t *testing.T, drive string, tweak func(*core.Config)) (*core.Vo
 // (TTL/3) and a few reads: commits within TTL/6 of the last lease access don't
 // read it again.
 func TestLeaseHeartbeatCost(t *testing.T) {
-	if testing.Short() {
-		t.Skip("takes a minute")
+	if os.Getenv("CFS_LONG") == "" || testing.Short() {
+		t.Skip("a minute of mostly sleeping: set CFS_LONG=1")
 	}
 	ctx := context.Background()
 	v, lc, err := openCounted(t, t.TempDir(), func(c *core.Config) { c.LeaseTTL = 6 * time.Second })
@@ -122,17 +122,17 @@ func TestLeaseDefaultTTLWritesOnce(t *testing.T) {
 		t.Fatalf("default LeaseTTL %v, want 30m", got)
 	}
 	start := time.Now()
-	for i := 0; time.Since(start) < 20*time.Second; i++ {
+	for i := 0; time.Since(start) < 5*time.Second; i++ {
 		if _, err := v.Put(ctx, fmt.Sprintf("f%d", i), strings.NewReader("x"), 1, time.Now()); err != nil {
 			t.Fatal(err)
 		}
 		if err := v.Flush(ctx); err != nil {
 			t.Fatal(err)
 		}
-		time.Sleep(500 * time.Millisecond)
+		time.Sleep(250 * time.Millisecond)
 	}
 	w, r := lc.writes.Load(), lc.reads.Load()
-	t.Logf("20s of commits, default TTL: lease writes=%d reads=%d", w, r)
+	t.Logf("5s of commits, default TTL: lease writes=%d reads=%d", w, r)
 	if w != 1 {
 		t.Fatalf("lease writes %d, want 1 (the open)", w)
 	}

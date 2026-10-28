@@ -5,8 +5,6 @@ package test
 
 import (
 	"fmt"
-	"io"
-	"io/fs"
 	"math/rand/v2"
 	"os"
 	"path"
@@ -28,42 +26,38 @@ func scratch(t testing.TB) string {
 	return `E:\Go\Openlist\tmp\cfs-bb`
 }
 
-func datasetSource(t testing.TB) string {
-	src := filepath.Join(scratch(t), "dataset", "op-sync")
-	if _, err := os.Stat(src); err != nil {
-		t.Skipf("dataset %s not present (copy of OP-sync): %v", src, err)
-	}
-	return src
-}
+// dsThreshold is the size from which the generated dataset's files count as
+// large (the servers of these tests run with testutil's 64 KiB threshold).
+const dsThreshold = 64 << 10
 
-func copyTree(t testing.TB, src, dst string) {
+// buildDataset writes a deterministic source tree below dst: 1500 files of a
+// source-tree-like mix of sizes (mostly small, some 10-100 KiB, a few above the
+// threshold), about 40 MB in all, in directories four levels deep.
+func buildDataset(t testing.TB, dst string, files int) {
 	t.Helper()
-	err := filepath.WalkDir(src, func(p string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return err
+	rng := rand.New(rand.NewPCG(42, 7))
+	exts := []string{".go", ".js", ".json", ".txt", ".md", ".css"}
+	for i := 0; i < files; i++ {
+		dir := fmt.Sprintf("p%d/q%d/r%d/s%d", i%6, (i/6)%5, (i/30)%4, (i/120)%3)
+		ext := exts[i%len(exts)]
+		var size int
+		switch r := rng.IntN(100); {
+		case i%250 == 3: // the large ones: .js, 1-3 MiB
+			size, ext = 1<<20+rng.IntN(3<<19), ".js"
+		case r < 70:
+			size = rng.IntN(8 << 10)
+		case r < 95:
+			size = 8<<10 + rng.IntN(60<<10)
+		default:
+			size = 100<<10 + rng.IntN(200<<10)
 		}
-		rel, _ := filepath.Rel(src, p)
-		target := filepath.Join(dst, rel)
-		if d.IsDir() {
-			return os.MkdirAll(target, 0o755)
+		p := filepath.Join(dst, filepath.FromSlash(dir), fmt.Sprintf("f%04d%s", i, ext))
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
 		}
-		in, err := os.Open(p)
-		if err != nil {
-			return err
+		if err := os.WriteFile(p, randData(rng, size), 0o644); err != nil {
+			t.Fatal(err)
 		}
-		defer in.Close()
-		out, err := os.Create(target)
-		if err != nil {
-			return err
-		}
-		if _, err := io.Copy(out, in); err != nil {
-			out.Close()
-			return err
-		}
-		return out.Close()
-	})
-	if err != nil {
-		t.Fatal(err)
 	}
 }
 
@@ -130,12 +124,16 @@ func uploadTree(t testing.TB, d *testutil.DAV, ref testutil.RefTree, root string
 	return
 }
 
+var dsWords = []string{"func ", "return ", "const ", "var ", "if ", "else ", "for ", "err ", "nil\n", "{\n", "}\n", "\t", "import ", "package ", "the ", "of ", "and ", "data ", "value ", "name ", "index ", "style ", "color: ", "margin: ", "0;\n", "1;\n"}
+
+// randData returns n bytes of deterministic, text-like content (low entropy,
+// like real source files).
 func randData(rng *rand.Rand, n int) []byte {
-	b := make([]byte, n)
-	for i := range b {
-		b[i] = byte(rng.Uint32())
+	b := make([]byte, 0, n+16)
+	for len(b) < n {
+		b = append(b, dsWords[rng.IntN(len(dsWords))]...)
 	}
-	return b
+	return b[:n]
 }
 
 type env struct {
@@ -198,15 +196,26 @@ func fsckOK(t *testing.T, s *testutil.Server, deep bool) {
 	t.Logf("fsck ok: packs=%v members=%v segments=%v", res["packs"], res["members"], res["segments"])
 }
 
-func runDataset(t *testing.T, e *env) {
-	src := datasetSource(t)
+func runDataset(t *testing.T, e *env, files int) {
 	refDir := filepath.Join(t.TempDir(), "ref")
 	os.MkdirAll(refDir, 0o755)
 	t0 := time.Now()
-	copyTree(t, src, refDir)
+	buildDataset(t, refDir, files)
 	ref := testutil.RefTree{Root: refDir}
 
-	s := e.serve(t, nil)
+	serve := func() *testutil.Server { return e.serve(t, nil) }
+	s := serve()
+	defer func() {
+		if t.Failed() {
+			var keep []string
+			for _, l := range strings.Split(s.LogAll(), "\n") {
+				if !strings.Contains(l, "Copied") {
+					keep = append(keep, l)
+				}
+			}
+			t.Logf("server exited=%v code=%d; its log without the copy lines:\n%s", s.Exited(), s.Wait(), strings.Join(keep, "\n"))
+		}
+	}()
 	files, bytes := uploadTree(t, s.DAV, ref, "", 12)
 	upload := time.Since(t0)
 	s.WaitDrained(t, 5*time.Minute)
@@ -242,13 +251,13 @@ func runDataset(t *testing.T, e *env) {
 			write(p, randData(rng, []int{0, 1, 700, 5000, 200 << 10}[rng.IntN(5)]))
 			changed++
 		case i%400 == 7: // small file grows past the threshold
-			write(p, randData(rng, 8<<20+1))
+			write(p, randData(rng, dsThreshold+1))
 			changed++
 		}
 	}
 	shrunk := 0
 	for _, p := range names {
-		if rf[p] > 8<<20 && shrunk < 2 && strings.HasSuffix(p, ".js") {
+		if rf[p] > dsThreshold && shrunk < 2 && strings.HasSuffix(p, ".js") {
 			write(p, randData(rng, 100))
 			shrunk++
 		}
@@ -333,7 +342,7 @@ func runDataset(t *testing.T, e *env) {
 	os.RemoveAll(e.state)
 	os.RemoveAll(e.cache)
 	t1 := time.Now()
-	s = e.serve(t, nil)
+	s = serve()
 	n, b = ref.Compare(t, s.DAV, "", true)
 	t.Logf("rebuilt from the drive and verified %d files, %d bytes in %v", n, b, time.Since(t1))
 	logStats(t, "after rebuild+verify", s)
@@ -350,7 +359,7 @@ func runDataset(t *testing.T, e *env) {
 	s.Kill()
 	os.RemoveAll(e.state)
 	os.RemoveAll(e.cache)
-	s = e.serve(t, nil)
+	s = serve()
 	ref.Compare(t, s.DAV, "", true)
 	t.Logf("rebuilt again after a hard kill (checkpoint + log replay): ok")
 	logStats(t, "after second rebuild", s)
@@ -358,10 +367,16 @@ func runDataset(t *testing.T, e *env) {
 }
 
 func TestDatasetLocal(t *testing.T) {
-	runDataset(t, newLocalEnv(t))
+	runDataset(t, newLocalEnv(t), 1500)
 }
 
 func TestDatasetWebDAV(t *testing.T) {
 	e, _ := newDavEnv(t, nil)
-	runDataset(t, e)
+	// A third of the tree: the point here is the drive behind WebDAV, the full tree runs in TestDatasetLocal
+	// (CFS_LONG=1 for all 1500 files).
+	files := 500
+	if os.Getenv("CFS_LONG") != "" {
+		files = 1500
+	}
+	runDataset(t, e, files)
 }
