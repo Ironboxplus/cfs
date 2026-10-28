@@ -1,6 +1,7 @@
 package core_test
 
 import (
+	"compress/gzip"
 	"context"
 	"errors"
 	"fmt"
@@ -8,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -141,9 +143,24 @@ func TestLeaseDefaultTTLWritesOnce(t *testing.T) {
 // A writer cut off from the drive for longer than the TTL is replaced; when the
 // network is back its next commit is fenced and writes no segment.
 func TestSilentWriterIsFencedAfterTakeover(t *testing.T) {
+	for round := 0; round < 6; round++ {
+		t.Run(fmt.Sprintf("round%d", round), silentWriterRound)
+	}
+}
+
+func silentWriterRound(t *testing.T) {
 	ctx := context.Background()
 	drive := t.TempDir()
-	a, lc, err := openCounted(t, drive, func(c *core.Config) { c.LeaseTTL = 3 * time.Second })
+	var lmu sync.Mutex
+	var logs []string
+	logf := func(who string) func(string, ...any) {
+		return func(format string, args ...any) {
+			lmu.Lock()
+			logs = append(logs, fmt.Sprintf("%s %s %s", time.Now().Format("15:04:05.000"), who, fmt.Sprintf(format, args...)))
+			lmu.Unlock()
+		}
+	}
+	a, lc, err := openCounted(t, drive, func(c *core.Config) { c.LeaseTTL = 3 * time.Second; c.Logf = logf("a") })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -163,10 +180,32 @@ func TestSilentWriterIsFencedAfterTakeover(t *testing.T) {
 		return m
 	}
 	before := segs()
+	dump := func() string {
+		var sb strings.Builder
+		fmt.Fprintf(&sb, "now %s; segments before: %v\n", time.Now().Format("15:04:05.000"), before)
+		ents, _ := os.ReadDir(filepath.Join(drive, ".cfs", "log"))
+		for _, e := range ents {
+			fi, _ := e.Info()
+			body := ""
+			if f, err := os.Open(filepath.Join(drive, ".cfs", "log", e.Name())); err == nil {
+				if zr, err := gzip.NewReader(f); err == nil {
+					b, _ := io.ReadAll(zr)
+					body = string(b)
+				}
+				f.Close()
+			}
+			fmt.Fprintf(&sb, "  %s written %s: %s\n", e.Name(), fi.ModTime().Format("15:04:05.000"), body)
+		}
+		lmu.Lock()
+		defer lmu.Unlock()
+		sb.WriteString(strings.Join(logs, "\n"))
+		return sb.String()
+	}
 
+	cutAt := time.Now()
 	lc.cut.Store(true)
 	time.Sleep(3500 * time.Millisecond) // longer than the TTL: the heartbeat can't run
-	b, err := openAt(t, drive, t.TempDir(), nil)
+	b, err := openAt(t, drive, t.TempDir(), func(c *core.Config) { c.Logf = logf("b") })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -175,18 +214,19 @@ func TestSilentWriterIsFencedAfterTakeover(t *testing.T) {
 		t.Fatalf("takeover: readonly=%v epoch %d (silent writer had %d)", b.ReadOnly(), b.Epoch(), a.Epoch())
 	}
 	lc.cut.Store(false)
+	logf("test")("cut at %s, uncut now", cutAt.Format("15:04:05.000"))
 
 	_, err = a.Put(ctx, "after.txt", strings.NewReader("two"), 3, time.Now())
 	if err == nil {
 		err = a.Flush(ctx)
 	}
 	if !errors.Is(err, core.ErrFenced) {
-		t.Fatalf("silent writer's next commit: %v, want ErrFenced", err)
+		t.Fatalf("silent writer's next commit: %v, want ErrFenced\n%s", err, dump())
 	}
 	prefix := fmt.Sprintf("%06d-", a.Epoch())
 	for name := range segs() {
 		if strings.HasPrefix(name, prefix) && !before[name] {
-			t.Fatalf("fenced writer wrote segment %s", name)
+			t.Fatalf("fenced writer wrote segment %s\n%s", name, dump())
 		}
 	}
 }
