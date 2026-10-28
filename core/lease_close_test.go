@@ -64,3 +64,47 @@ func TestLeaseReleasedByCloseDespiteAHeartbeatInFlight(t *testing.T) {
 		}
 	}
 }
+
+// A second Close, while the first is still at work, waits for it. A process
+// that closes its volumes from two places at exit (rclone's Fs shutdown and the
+// exit handler) otherwise exits as soon as the second one returns, with the
+// first one in the middle of releasing the lease: the next writer finds a live
+// lease and opens read-only.
+func TestSecondCloseWaitsForTheFirst(t *testing.T) {
+	drive := t.TempDir()
+	pr := &probe{Store: testutil.LocalStore(t, drive)}
+	pr.putHook = func(path string, src store.Source) time.Duration {
+		if path == core.CtlDir+"/lease.json" {
+			rc, err := src.Open()
+			if err == nil {
+				b, _ := io.ReadAll(rc)
+				rc.Close()
+				if bytes.Contains(b, []byte(`"released":true`)) {
+					return 800 * time.Millisecond // the release takes its time to land
+				}
+			}
+		}
+		return 0
+	}
+	st, _ := testutil.Stacked(pr, aspect.Options{})
+	v, err := core.Open(context.Background(), st, testutil.FastConfig(t.TempDir()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := make(chan error, 1)
+	go func() { first <- v.Close(context.Background()) }()
+	time.Sleep(300 * time.Millisecond) // the first Close is waiting for the release to land
+	if err := v.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(filepath.Join(drive, ".cfs", "lease.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(b, []byte(`"released":true`)) {
+		t.Fatalf("the second Close returned before the first had released the lease: %s", b)
+	}
+	if err := <-first; err != nil {
+		t.Fatal(err)
+	}
+}
