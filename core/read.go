@@ -9,7 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
+	"time"
 
 	"github.com/Ironboxplus/cfs/store"
 )
@@ -40,8 +40,11 @@ func (v *Volume) Open(ctx context.Context, p string, off, n int64) (io.ReadClose
 		}
 		data, err := v.memberBytes(ctx, r)
 		if err != nil {
-			// The staged file went to its pack between the lookup and the read.
-			if r.Pack == "" && errors.Is(err, os.ErrNotExist) && try < 3 {
+			// The staged file went to its pack between the lookup and the read (on
+			// Windows a file being deleted can't be opened, which is not ErrNotExist):
+			// look the name up again.
+			if r.Pack == "" && !errors.Is(err, ErrCorrupt) && try < 5 {
+				time.Sleep(time.Duration(try) * 2 * time.Millisecond)
 				continue
 			}
 			return nil, err

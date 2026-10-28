@@ -203,24 +203,30 @@ func (ix *index) listDirCommitted(dir string) ([]fileRow, error) {
 
 // listDir lists the small files of dir as readers see them.
 func (ix *index) listDir(dir string) ([]fileRow, error) {
-	out, err := ix.listDirCommitted(dir)
-	if err != nil {
-		return nil, err
-	}
+	// Staged rows first: a commit moves a file from staged to committed in one
+	// transaction, so a file not staged by the time the staged rows were read is
+	// committed by the time the committed rows are. The other order could miss
+	// both and show the previous version.
 	srows, err := ix.db.Query("SELECT "+stagedCols+" FROM staged WHERE dir=?", dir)
 	if err != nil {
 		return nil, err
 	}
-	defer srows.Close()
 	var staged []fileRow
 	for srows.Next() {
 		r, err := stagedRow(srows)
 		if err != nil {
+			srows.Close()
 			return nil, err
 		}
 		staged = append(staged, r)
 	}
-	if err := srows.Err(); err != nil {
+	serr := srows.Err()
+	srows.Close()
+	if serr != nil {
+		return nil, serr
+	}
+	out, err := ix.listDirCommitted(dir)
+	if err != nil {
 		return nil, err
 	}
 	if len(staged) == 0 {

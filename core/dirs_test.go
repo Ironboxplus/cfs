@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -492,5 +493,145 @@ func TestLazyDirsShapeChecks(t *testing.T) {
 	}
 	if err := e.v.Mkdir(ctx, "emptydir"); err != nil {
 		t.Errorf("mkdir of an existing directory: %v", err)
+	}
+}
+
+// Writes into a directory right after it was renamed replace the files that
+// moved with it, before and after the commit, a reopen and a rebuild.
+func TestOverwriteAfterDirMove(t *testing.T) {
+	for _, ack := range []core.AckMode{core.AckStaged, core.AckDurable} {
+		t.Run(string(ack), func(t *testing.T) {
+			ctx := context.Background()
+			e := newEnv(t, aspectOpts(), func(c *core.Config) { c.Ack = ack; c.Threshold = 1 << 20 })
+			for i := 0; i < 6; i++ {
+				e.put(fmt.Sprintf("a/src/sub/f%d", i), []byte(fmt.Sprintf("old %d", i)))
+			}
+			if err := e.v.Flush(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if err := e.v.DirMove(ctx, "a/src", "a/dst"); err != nil {
+				t.Fatal(err)
+			}
+			check := func(when string) {
+				t.Helper()
+				for i := 0; i < 6; i++ {
+					want := fmt.Sprintf("old %d", i)
+					if i%2 == 0 {
+						want = fmt.Sprintf("new content %d", i)
+					}
+					p := fmt.Sprintf("a/dst/sub/f%d", i)
+					if got := string(e.read(p)); got != want {
+						t.Fatalf("%s: %s = %q, want %q", when, p, got, want)
+					}
+					en, err := e.v.Stat(ctx, p)
+					if err != nil || en.Size != int64(len(want)) {
+						t.Fatalf("%s: stat %s = %+v %v, want size %d", when, p, en, err, len(want))
+					}
+				}
+				for _, en := range func() []core.Entry { l, _ := e.v.List(ctx, "a/dst/sub"); return l }() {
+					if en.Size < 5 || en.Size > 14 {
+						t.Fatalf("%s: listing says %s is %d bytes", when, en.Path, en.Size)
+					}
+				}
+			}
+			for i := 0; i < 6; i += 2 {
+				e.put(fmt.Sprintf("a/dst/sub/f%d", i), []byte(fmt.Sprintf("new content %d", i)))
+			}
+			check("right after the writes")
+			if err := e.v.Flush(ctx); err != nil {
+				t.Fatal(err)
+			}
+			check("after the flush")
+			e.reopen()
+			check("after a reopen")
+			if err := e.v.Close(ctx); err != nil {
+				t.Fatal(err)
+			}
+			e.v = nil
+			removeAll(t, e.state)
+			e.newState()
+			e.open()
+			check("after a rebuild")
+		})
+	}
+}
+
+// Once a write is acknowledged, no read sees the previous version again, not
+// even while the write is being committed.
+func TestOverwriteNeverRevertsDuringCommit(t *testing.T) {
+	ctx := context.Background()
+	e := newEnv(t, aspectOpts(), func(c *core.Config) {
+		c.Threshold = 1 << 20
+		c.SealQuiet = time.Millisecond
+		c.SealMax = 5 * time.Millisecond
+	})
+	for round := 0; round < 60; round++ {
+		dir := fmt.Sprintf("r%d", round)
+		old := bytes.Repeat([]byte("o"), 3000+round)
+		for i := 0; i < 4; i++ {
+			e.put(fmt.Sprintf("%s/f%d", dir, i), old)
+		}
+		if err := e.v.Flush(ctx); err != nil {
+			t.Fatal(err)
+		}
+		nw := bytes.Repeat([]byte("n"), 100+round)
+		p := dir + "/f1"
+		e.put(p, nw)
+		stop := make(chan struct{})
+		var wg sync.WaitGroup
+		bad := make(chan string, 8)
+		for w := 0; w < 3; w++ {
+			wg.Add(1)
+			go func(w int) {
+				defer wg.Done()
+				for {
+					select {
+					case <-stop:
+						return
+					default:
+					}
+					switch w {
+					case 0:
+						ents, err := e.v.List(ctx, dir)
+						if err != nil {
+							bad <- err.Error()
+							return
+						}
+						for _, en := range ents {
+							if en.Name() == "f1" && en.Size != int64(len(nw)) {
+								bad <- fmt.Sprintf("list: f1 is %d bytes", en.Size)
+								return
+							}
+						}
+					case 1:
+						if en, err := e.v.Stat(ctx, p); err != nil || en.Size != int64(len(nw)) {
+							bad <- fmt.Sprintf("stat: %+v %v", en, err)
+							return
+						}
+					default:
+						rc, err := e.v.Open(ctx, p, 0, -1)
+						if err != nil {
+							bad <- err.Error()
+							return
+						}
+						b, _ := io.ReadAll(rc)
+						rc.Close()
+						if !bytes.Equal(b, nw) {
+							bad <- fmt.Sprintf("read: %d bytes", len(b))
+							return
+						}
+					}
+				}
+			}(w)
+		}
+		time.Sleep(30 * time.Millisecond)
+		e.v.Flush(ctx)
+		close(stop)
+		wg.Wait()
+		select {
+		case m := <-bad:
+			t.Fatalf("round %d: %s", round, m)
+		default:
+		}
 	}
 }
