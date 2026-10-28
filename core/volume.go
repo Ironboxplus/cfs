@@ -75,6 +75,8 @@ type Volume struct {
 	inflight map[*batch]struct{}
 	slots    chan struct{}
 
+	stg *stager // acknowledged small files that aren't on the drive yet (AckStaged)
+
 	metaMu    sync.Mutex
 	metaQuiet *time.Timer
 	metaMax   *time.Timer
@@ -120,6 +122,7 @@ func Open(ctx context.Context, st store.Store, cfg Config) (*Volume, error) {
 		dc:       newDirCache(cfg.DirCacheTTL),
 		mc:       newMemCache(cfg.MemberCache),
 		wc:       newMemCache(32 << 20),
+		stg:      newStager(cfg.StateDir),
 	}
 	v.ctx, v.cancel = context.WithCancel(context.Background())
 	if err := os.MkdirAll(filepath.Join(cfg.StateDir, "spool"), 0o755); err != nil {
@@ -170,6 +173,9 @@ func Open(ctx context.Context, st store.Store, cfg Config) (*Volume, error) {
 	if err := ix.kvSet("inited", "1"); err != nil {
 		return fail(err)
 	}
+	if err := v.stageInit(); err != nil {
+		return fail(err)
+	}
 	if !v.ReadOnly() {
 		if err := v.st.Mkdir(ctx, ""); err != nil && !errors.Is(err, store.ErrExists) {
 			return fail(fmt.Errorf("cfs: create root: %w", err))
@@ -191,6 +197,9 @@ func newID() string {
 func (v *Volume) Flush(ctx context.Context) error {
 	if v.ReadOnly() {
 		return nil
+	}
+	if err := v.waitStaged(ctx, func(string) bool { return true }); err != nil {
+		return err
 	}
 	if err := v.flushBatches(ctx); err != nil {
 		return err
@@ -227,6 +236,7 @@ func (v *Volume) Close(ctx context.Context) error {
 	v.metaMu.Unlock()
 	v.cancel()
 	v.wg.Wait()
+	v.abandonBatch()
 	keep(v.ix.close())
 	return first
 }
@@ -307,8 +317,12 @@ func (v *Volume) readLease(ctx context.Context) (lease, bool, error) {
 		}
 		lastErr = err
 	}
-	return lease{}, false, fmt.Errorf("cfs: unreadable lease: %w", lastErr)
+	return lease{}, false, fmt.Errorf("%w: %v", errBadLease, lastErr)
 }
+
+// errBadLease is a lease file that stays unreadable: a writer that died while
+// rewriting it (the drive has no atomic replace) leaves it truncated for good.
+var errBadLease = errors.New("cfs: unreadable lease")
 
 func (v *Volume) writeLease(ctx context.Context, released bool) error {
 	l := lease{Writer: v.writerID, Epoch: v.epoch, Heartbeat: time.Now().UnixMilli(), Released: released}
@@ -347,6 +361,13 @@ func (v *Volume) maxDriveEpoch(ctx context.Context, l lease, haveLease bool) (ui
 // itself when it sees a newer epoch.
 func (v *Volume) takeLease(ctx context.Context) error {
 	l, ok, err := v.readLease(ctx)
+	if errors.Is(err, errBadLease) {
+		// Nobody can be heartbeating into a file that has stayed unreadable
+		// through all the retries: treat it as absent. The epoch still comes
+		// from what the drive holds.
+		v.logf("cfs: %v: taking the volume over", err)
+		l, ok, err = lease{}, false, nil
+	}
 	if err != nil {
 		return err
 	}
@@ -424,6 +445,10 @@ func (v *Volume) heartbeatLoop() {
 type dirEnt struct {
 	at   time.Time
 	ents map[string]store.Entry
+	// absent: the drive said the directory doesn't exist. Directories that only
+	// staged files live in don't exist there until their pack is committed, and
+	// every Put under one would otherwise list it again.
+	absent bool
 }
 
 type dirCache struct {
@@ -464,6 +489,9 @@ func (v *Volume) listStore(ctx context.Context, dir string) (map[string]store.En
 	c.mu.Lock()
 	if e, ok := c.m[dir]; ok && time.Since(e.at) < c.ttl {
 		c.mu.Unlock()
+		if e.absent {
+			return nil, store.ErrNotFound
+		}
 		return e.ents, nil
 	}
 	if f, ok := c.sf[dir]; ok {
@@ -496,6 +524,8 @@ func (v *Volume) listStore(ctx context.Context, dir string) (map[string]store.En
 				c.known[e.Path] = time.Now()
 			}
 		}
+	} else if errors.Is(err, store.ErrNotFound) {
+		c.m[dir] = &dirEnt{at: time.Now(), absent: true}
 	}
 	c.mu.Unlock()
 	f.ents, f.err = m, err
@@ -577,6 +607,7 @@ func (v *Volume) mkdirAll(ctx context.Context, dir string) error {
 	}
 	v.dc.cacheAdd(store.Entry{Path: dir, IsDir: true, ModTime: time.Now()})
 	v.dc.markKnown(dir)
+	v.dc.nowExists(dir)
 	return nil
 }
 
@@ -609,17 +640,20 @@ func (v *Volume) Stat(ctx context.Context, p string) (Entry, error) {
 	}
 	dir, name := splitPath(p)
 	ents, err := v.listStore(ctx, dir)
-	if err != nil {
-		if errors.Is(err, store.ErrNotFound) {
-			return Entry{}, store.ErrNotFound
+	if err == nil {
+		if e, ok := ents[name]; ok {
+			return bigEntry(e), nil
 		}
+	} else if !errors.Is(err, store.ErrNotFound) {
 		return Entry{}, err
 	}
-	e, ok := ents[name]
-	if !ok {
-		return Entry{}, store.ErrNotFound
+	// A directory that only exists because staged files are going to live in it.
+	if any, err := v.ix.anyStagedUnder(p); err != nil {
+		return Entry{}, err
+	} else if any {
+		return Entry{Path: p, IsDir: true, ModTime: time.Now()}, nil
 	}
-	return bigEntry(e), nil
+	return Entry{}, store.ErrNotFound
 }
 
 // List returns the children of dir: directories and large files from the
@@ -640,14 +674,24 @@ func (v *Volume) List(ctx context.Context, dir string) ([]Entry, error) {
 	if err != nil {
 		return nil, err
 	}
-	if lerr != nil && len(rows) == 0 && dir != "" {
+	sdirs, err := v.ix.stagedDirs(dir)
+	if err != nil {
+		return nil, err
+	}
+	if lerr != nil && len(rows) == 0 && len(sdirs) == 0 && dir != "" {
 		return nil, store.ErrNotFound
 	}
-	out := make([]Entry, 0, len(ents)+len(rows))
+	out := make([]Entry, 0, len(ents)+len(rows)+len(sdirs))
 	small := make(map[string]bool, len(rows))
 	for _, r := range rows {
 		small[r.Name] = true
 		out = append(out, v.rowEntry(r))
+	}
+	for _, name := range sdirs {
+		if _, ok := ents[name]; !ok && !small[name] {
+			small[name] = true
+			out = append(out, Entry{Path: path.Join(dir, name), IsDir: true, ModTime: time.Now()})
+		}
 	}
 	for name, e := range ents {
 		if small[name] || (dir == "" && strings.HasPrefix(name, ".cfs")) {
@@ -739,3 +783,13 @@ func isNotFound(err error) bool { return errors.Is(err, store.ErrNotFound) }
 
 var _ = path.Join
 var _ = sql.ErrNoRows
+
+// nowExists turns a cached "no such directory" into an empty directory, after
+// it has been created.
+func (c *dirCache) nowExists(dir string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if d, ok := c.m[dir]; ok && d.absent {
+		c.m[dir] = &dirEnt{at: time.Now(), ents: map[string]store.Entry{}}
+	}
+}

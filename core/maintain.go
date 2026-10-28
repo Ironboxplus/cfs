@@ -391,7 +391,7 @@ func (v *Volume) Fsck(ctx context.Context, opts FsckOpts) (FsckReport, error) {
 			}
 			return rep, err
 		}
-		rows, _ := v.ix.listDir(d)
+		rows, _ := v.ix.listDirCommitted(d)
 		for _, r := range rows {
 			e, ok := lm[r.Name]
 			if !ok {

@@ -30,8 +30,31 @@ var DefaultStoreSuffixes = []string{
 	".pickle", ".whl",
 }
 
+// AckMode says when Put of a small file returns.
+type AckMode string
+
+const (
+	// AckStaged (the default): the data is fsynced to a local staging area and
+	// recorded in the local index, then Put returns. Packing and commit to the
+	// drive happen in the background, so a pack holds whatever arrived in the
+	// seal window however few callers there are. The data is readable and
+	// listed from the staging area meanwhile, and replayed after a restart until
+	// it is on the drive. Only losing the local disk before the upload loses
+	// acknowledged data.
+	AckStaged AckMode = "staged"
+	// AckDurable: Put returns when the pack holding the file and the log
+	// segment describing it are on the drive. Files per pack are then about the
+	// number of concurrent callers.
+	AckDurable AckMode = "durable"
+)
+
 // Config configures a Volume. Zero values mean the defaults noted.
 type Config struct {
+	// Ack: when Put of a small file returns. Default AckStaged.
+	Ack AckMode
+	// StageMaxBytes caps the data waiting in the staging area (AckStaged): Put
+	// blocks, it does not fail, while the area is full. Default 1 GiB.
+	StageMaxBytes int64
 	// StateDir holds the local SQLite index and spool. Required. Losing it is
 	// safe: it is rebuilt from the drive.
 	StateDir string
@@ -43,7 +66,12 @@ type Config struct {
 	PackMaxBytes int64
 	PackMaxFiles int
 	// SealQuiet seals the open pack when no small file arrived for this long;
-	// SealMax seals it this long after its first file. Defaults 2s and 15s.
+	// SealMax seals it this long after its first file. Defaults: 2s and 15s with
+	// AckDurable, where callers wait for the commit. With AckStaged nobody
+	// waits, so a short quiet period would only cut small packs out of a slow
+	// stream of files: the defaults are 10s (a pause that ends a burst) and 60s
+	// (the longest a file waits for its pack; Flush, Close and any operation
+	// that touches a staged name seal at once, and so does a full staging area).
 	SealQuiet time.Duration
 	SealMax   time.Duration
 	// ReadChunk is the size of one ranged read of a large file. Default 8 MiB.
@@ -95,11 +123,28 @@ func (c *Config) fill() error {
 	if c.PackMaxFiles <= 0 {
 		c.PackMaxFiles = 10000
 	}
+	switch c.Ack {
+	case "":
+		c.Ack = AckStaged
+	case AckStaged, AckDurable:
+	default:
+		return fmt.Errorf("cfs: unknown ack mode %q (want %q or %q)", c.Ack, AckStaged, AckDurable)
+	}
+	if c.StageMaxBytes <= 0 {
+		c.StageMaxBytes = 1 << 30
+	}
+	staged := c.Ack == AckStaged
 	if c.SealQuiet <= 0 {
 		c.SealQuiet = 2 * time.Second
+		if staged {
+			c.SealQuiet = 10 * time.Second
+		}
 	}
 	if c.SealMax <= 0 {
 		c.SealMax = 15 * time.Second
+		if staged {
+			c.SealMax = time.Minute
+		}
 	}
 	if c.ReadChunk <= 0 {
 		c.ReadChunk = 8 << 20

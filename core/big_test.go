@@ -197,6 +197,9 @@ func TestThresholdEdges(t *testing.T) {
 		if e.Packed == wantLarge {
 			t.Fatalf("%s (%d bytes): packed=%v, want large=%v", p, len(want), e.Packed, wantLarge)
 		}
+		if err := v.Flush(ctx); err != nil { // staged files are on the drive only after this
+			t.Fatal(err)
+		}
 		if loose(p) != wantLarge {
 			t.Fatalf("%s (%d bytes): stored loose on the drive = %v, want %v", p, len(want), loose(p), wantLarge)
 		}

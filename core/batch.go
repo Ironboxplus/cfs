@@ -37,6 +37,7 @@ type member struct {
 	meth       uint16
 	expect     string // compaction: only apply while the path still points here
 	strayBig   bool   // a large file of the same name must be removed after commit
+	id         int64  // stage id of an acknowledged-but-uncommitted file (AckStaged), else 0
 	superseded bool
 	// state is memberPending until the commit takes the member along
 	// (memberLocked) or its caller gives up first (memberCancelled). Whoever
@@ -293,7 +294,7 @@ func (v *Volume) waitConflicts(ctx context.Context, match func(string) bool) err
 			return ctx.Err()
 		}
 	}
-	return nil
+	return v.waitStaged(ctx, match)
 }
 
 func (v *Volume) finishBatch(b *batch, err error) {
@@ -325,12 +326,15 @@ func (v *Volume) commit(b *batch) {
 		v.logf("cfs: commit of pack %s failed: %v", b.pack, err)
 	}
 	v.finishBatch(b, err)
+	if err != nil {
+		v.stageFailed(b, err)
+	}
 	if err == nil && v.cfg.CheckpointEvery > 0 && v.segsNew.Add(1) >= int64(v.cfg.CheckpointEvery) {
 		v.maybeCheckpoint()
 	}
 }
 
-func (v *Volume) commitInner(b *batch) error {
+func (v *Volume) commitInner(b *batch) (err error) {
 	ctx := v.ctx
 	if err := v.writable(); err != nil {
 		return err
@@ -347,12 +351,40 @@ func (v *Volume) commitInner(b *batch) error {
 	}
 	v.ckptMu.RLock()
 	defer v.ckptMu.RUnlock()
-	seq, err := v.ix.allocSeq()
+	// The sequence number and the metadata rows that ride in this segment are
+	// fixed together, before anything is uploaded (see sealPending). From here
+	// on the rows belong to this segment name for good: if the commit fails they
+	// are uploaded under the same name by the metadata flush, never under a later
+	// one.
+	seq, pend, err := v.ix.sealPending(v.epoch, true, false)
 	if err != nil {
 		return err
 	}
+	segKey := segKeyOf(v.epoch, seq)
+	landed := false
+	defer func() {
+		if err != nil && !landed {
+			v.releaseInflight(segKey)
+		}
+	}()
 	b.seq = seq
 	b.pack = packName(v.epoch, seq)
+	// Journal the removal of the loose files these members will shadow, before
+	// anything is uploaded: whichever step a crash interrupts, the next start
+	// removes them once the packed file is in the index (finishInterrupted). A
+	// key whose commit never happened does nothing: there is no packed file.
+	if err := v.ix.tx(func(tx *sql.Tx) error {
+		for _, m := range live {
+			if m.strayBig {
+				if err := kvSet(tx, strayKey+m.path, "1"); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
 	pm := packManifest{Pack: b.pack, Epoch: v.epoch, Seq: seq}
 	for _, m := range live {
 		pm.Members = append(pm.Members, metalog.Record{Op: metalog.OpPut, Path: m.path, Size: m.size, MTime: m.mtime,
@@ -407,29 +439,8 @@ func (v *Volume) commitInner(b *batch) error {
 	}
 	crash.Point("pack_verified")
 
-	// Take the pending metadata operations along: they go into this segment
-	// ahead of the puts. Sealing and the in-flight marker are one transaction.
-	segKey := segKeyOf(v.epoch, seq)
-	var pend []pendingRow
-	err = v.ix.tx(func(tx *sql.Tx) error {
-		var err error
-		if pend, err = readPending(tx, "WHERE seg IS NULL"); err != nil {
-			return err
-		}
-		if _, err = tx.Exec("UPDATE pending SET seg=? WHERE seg IS NULL", segKey); err != nil {
-			return err
-		}
-		if _, err = tx.Exec("INSERT OR IGNORE INTO segs(name) VALUES(?)", segKey); err != nil {
-			return err
-		}
-		_, err = tx.Exec("INSERT OR IGNORE INTO inflight(name) VALUES(?)", segKey)
-		return err
-	})
-	if err != nil {
-		return err
-	}
 	for _, m := range live {
-		if r, ok, err := v.ix.get(m.path); err == nil {
+		if r, ok, err := v.ix.getCommitted(m.path); err == nil {
 			m.prev, m.hadPrev = r, ok
 		}
 	}
@@ -444,16 +455,24 @@ func (v *Volume) commitInner(b *batch) error {
 		puts = append(puts, r)
 	}
 	seg.Records = append(seg.Records, puts...)
-	if err := v.log.AppendSegment(ctx, seg); err != nil {
-		v.unseal(segKey)
+	if err := v.appendSegment(ctx, seg); err != nil {
 		return err
 	}
+	landed = true
 	crash.Point("log_uploaded")
 	err = v.ix.tx(func(tx *sql.Tx) error {
 		for _, r := range puts {
 			if err := applyRecord(tx, r, seq); err != nil {
 				return err
 			}
+		}
+		for _, m := range live {
+			if m.id != 0 {
+				if _, err := tx.Exec("DELETE FROM staged WHERE path=? AND id=?", m.path, m.id); err != nil {
+					return err
+				}
+			}
+
 		}
 		if _, err := tx.Exec("INSERT OR REPLACE INTO packs(name,epoch,seq,bytes,sha1,members,dead_at) VALUES(?,?,?,?,?,?,0)",
 			b.pack, v.epoch, seq, size, packSHA, len(live)); err != nil {
@@ -472,30 +491,90 @@ func (v *Volume) commitInner(b *batch) error {
 	for _, m := range live {
 		if m.strayBig {
 			if err := v.st.Remove(ctx, m.path); err != nil && !isNotFound(err) {
-				v.logf("cfs: remove shadowed large file %s: %v", m.path, err)
+				v.logf("cfs: remove shadowed large file %s: %v (will be repeated at the next start)", m.path, err)
+			} else {
+				v.ix.db.Exec("DELETE FROM kv WHERE k=?", strayKey+m.path)
 			}
 		}
 		v.dc.cacheDel(m.path)
 	}
+	v.stageDone(live)
 	return nil
 }
 
-// unseal gives the pending rows of a segment that failed to upload back to
-// the unsealed queue.
-func (v *Volume) unseal(segKey string) {
-	err := v.ix.tx(func(tx *sql.Tx) error {
-		if _, err := tx.Exec("UPDATE pending SET seg=NULL WHERE seg=?", segKey); err != nil {
+// segmentTries is how often a commit uploads one and the same segment before it
+// gives up on it.
+const segmentTries = 4
+
+// appendSegment uploads seg. A failed upload may still have landed (the answer
+// was lost), so after a failure the drive is asked what it holds under that
+// name; when that isn't conclusive the very same segment is uploaded again.
+// Uploading a segment is idempotent. What must never happen is that the
+// records of seg reappear under a later sequence number: they could then be
+// replayed after writes that came after them.
+func (v *Volume) appendSegment(ctx context.Context, seg metalog.Segment) error {
+	var err error
+	for try := 0; try < segmentTries; try++ {
+		if try > 0 {
+			select {
+			case <-time.After(time.Duration(200<<(try-1)) * time.Millisecond):
+			case <-ctx.Done():
+				return err
+			}
+		}
+		if err = v.log.AppendSegment(ctx, seg); err == nil {
+			return nil
+		}
+		if ctx.Err() != nil {
 			return err
 		}
-		if _, err := tx.Exec("DELETE FROM segs WHERE name=?", segKey); err != nil {
-			return err
+		if v.segmentLanded(ctx, seg) {
+			v.logf("cfs: log segment %d-%d landed although its upload reported: %v", seg.Epoch, seg.Seq, err)
+			return nil
 		}
-		_, err := tx.Exec("DELETE FROM inflight WHERE name=?", segKey)
-		return err
-	})
-	if err != nil {
-		v.logf("cfs: unseal %s: %v", segKey, err)
 	}
+	return err
+}
+
+// segmentLanded reports whether the drive holds exactly seg.
+func (v *Volume) segmentLanded(ctx context.Context, seg metalog.Segment) bool {
+	refs, err := v.log.ListSegments(ctx)
+	if err != nil {
+		return false
+	}
+	for _, r := range refs {
+		if r.Epoch != seg.Epoch || r.Seq != seg.Seq {
+			continue
+		}
+		got, err := v.log.ReadSegment(ctx, r)
+		if err != nil || got.Pack != seg.Pack || len(got.Records) != len(seg.Records) {
+			return false
+		}
+		for i := range got.Records {
+			if got.Records[i] != seg.Records[i] {
+				return false
+			}
+		}
+		return true
+	}
+	return false
+}
+
+// releaseInflight gives up the commit of a segment that did not (verifiably)
+// reach the drive. Its pending metadata rows stay sealed under the SAME segment
+// key and are sent again, under that name, by the metadata flush: the upload
+// is idempotent, and a record is never re-emitted under a later sequence number
+// where it could be replayed after the writes that came after it. The retry
+// carries the metadata rows only: the puts of the failed commit were either
+// reported to their callers as failed (AckDurable) or are staged and go out
+// again in a later pack (AckStaged), and a copy of the segment that landed
+// although the call failed is overwritten by the retry.
+func (v *Volume) releaseInflight(segKey string) {
+	if _, err := v.ix.db.Exec("DELETE FROM inflight WHERE name=?", segKey); err != nil {
+		v.logf("cfs: release %s: %v", segKey, err)
+		return
+	}
+	v.kickMeta()
 }
 
 func packName(epoch, seq uint64) string { return fmt.Sprintf("p-%06d-%010d.zip", epoch, seq) }
@@ -511,3 +590,31 @@ func parseSegKey(k string) (epoch, seq uint64, ok bool) {
 	_, err2 := fmt.Sscanf(s, "%d", &seq)
 	return epoch, seq, err1 == nil && err2 == nil
 }
+
+// abandonBatch drops the pack that is still filling when the volume closes
+// without having been able to flush it (the drive refused). Whatever went into
+// it is staged (it is replayed at the next start) or was never acknowledged.
+func (v *Volume) abandonBatch() {
+	v.batchMu.Lock()
+	defer v.batchMu.Unlock()
+	b := v.cur
+	if b == nil {
+		return
+	}
+	v.cur = nil
+	b.sealed = true
+	if b.quiet != nil {
+		b.quiet.Stop()
+	}
+	if b.max != nil {
+		b.max.Stop()
+	}
+	b.f.Close()
+	os.Remove(b.spool)
+	delete(v.inflight, b)
+	close(b.done)
+}
+
+// strayKey prefixes the kv rows that say a large file of that name still has to
+// be removed because a packed file of the same name has replaced it.
+const strayKey = "stray:"

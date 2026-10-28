@@ -236,6 +236,9 @@ func TestMetadataOps(t *testing.T) {
 	if string(e.read("d/moved/big.bin")) != "tiny" {
 		t.Fatal("shrunk content")
 	}
+	if err := e.v.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := os.Stat(filepath.Join(e.drive, "d", "moved", "big.bin")); err == nil {
 		t.Fatal("old large version still on the drive")
 	}
@@ -299,7 +302,7 @@ func TestTransfersOverlap(t *testing.T) {
 			defer wg.Done()
 			sz := 1000
 			if i%10 == 0 {
-				sz = 300 << 10
+				sz = 4 << 20 // long enough for uploads to be seen overlapping
 			}
 			p := fmt.Sprintf("x/%d/f%d", i%7, i)
 			if _, err := e.v.Put(context.Background(), p, bytes.NewReader(make([]byte, sz)), int64(sz), time.Now()); err != nil {
@@ -367,6 +370,9 @@ func TestExternalChangesAreSeenAfterCacheExpiry(t *testing.T) {
 	e.put("ext/small.txt", []byte("packed"))
 	if n := e.listNames("ext"); fmt.Sprint(n) != "[small.txt]" {
 		t.Fatalf("before: %v", n)
+	}
+	if err := e.v.Flush(ctx); err != nil { // the packed file's directory exists on the drive
+		t.Fatal(err)
 	}
 	os.WriteFile(filepath.Join(e.drive, "ext", "added.bin"), []byte("dropped in from outside"), 0o644)
 	os.MkdirAll(filepath.Join(e.drive, "ext", "newdir"), 0o755)

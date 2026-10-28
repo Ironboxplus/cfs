@@ -42,6 +42,9 @@ func TestSecondWriterIsReadOnly(t *testing.T) {
 	if _, err := a.Put(ctx, "x/a.txt", bytes.NewReader(data), int64(len(data)), time.Now()); err != nil {
 		t.Fatal(err)
 	}
+	if err := a.Flush(ctx); err != nil { // a follower sees what is on the drive
+		t.Fatal(err)
+	}
 	b, err := openAt(t, drive, t.TempDir(), nil)
 	if err != nil {
 		t.Fatal(err)
@@ -63,6 +66,9 @@ func TestSecondWriterIsReadOnly(t *testing.T) {
 	// It follows the writer.
 	more := []byte("written later")
 	a.Put(ctx, "x/later.txt", bytes.NewReader(more), int64(len(more)), time.Now())
+	if err := a.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
 	if err := b.Refresh(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -146,8 +152,15 @@ func TestFencedWriterStops(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, err = a.Put(ctx, "late.txt", strings.NewReader("too late"), 8, time.Now())
+	if err == nil {
+		// Acknowledged from the staging area: the commit is what finds out.
+		err = a.Flush(ctx)
+	}
 	if !errors.Is(err, core.ErrFenced) {
 		t.Fatalf("fenced writer's put: %v", err)
+	}
+	if _, err := a.Put(ctx, "later.txt", strings.NewReader("still too late"), 14, time.Now()); !errors.Is(err, core.ErrFenced) {
+		t.Fatalf("put after the writer knows it is fenced: %v", err)
 	}
 	if _, serr := os.Stat(filepath.Join(drive, ".cfs", "packs")); serr == nil {
 		ents, _ := os.ReadDir(filepath.Join(drive, ".cfs", "packs"))

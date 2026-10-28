@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -26,9 +27,11 @@ type faultEnv struct {
 	proxy *testutil.FaultProxy
 	v     *core.Volume
 	meter *aspect.Meter
+	// stateDir is the volume's local state, for tests that open it again.
+	stateDir string
 }
 
-func newFaultEnv(t *testing.T, retries int) *faultEnv {
+func newFaultEnv(t *testing.T, retries int, tweak ...func(*core.Config)) *faultEnv {
 	drive := t.TempDir()
 	url, _ := testutil.WebDAVServer(t, drive)
 	proxy := testutil.NewFaultProxy(t, url)
@@ -37,15 +40,19 @@ func newFaultEnv(t *testing.T, retries int) *faultEnv {
 		Gate:  aspect.GateOpts{MetaInflight: 1, Transfers: 4},
 		Retry: aspect.RetryOpts{Attempts: retries, Base: 20 * time.Millisecond, Max: 100 * time.Millisecond},
 	})
-	cfg := testutil.FastConfig(t.TempDir())
+	stateDir := t.TempDir()
+	cfg := testutil.FastConfig(stateDir)
 	cfg.Threshold = 64 << 10
 	cfg.Pipeline = 4
+	for _, f := range tweak {
+		f(&cfg)
+	}
 	v, err := core.Open(context.Background(), st, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { v.Close(context.Background()) })
-	return &faultEnv{t: t, drive: drive, proxy: proxy, v: v, meter: m}
+	return &faultEnv{t: t, drive: drive, proxy: proxy, v: v, meter: m, stateDir: stateDir}
 }
 
 func isPut(r *http.Request) bool      { return r.Method == "PUT" }
@@ -195,7 +202,7 @@ func TestFaultSlowListing(t *testing.T) {
 // With the drive down for good, writes fail cleanly and nothing half-written
 // becomes visible; once the drive is back, the same volume works again.
 func TestFaultDriveDownThenUp(t *testing.T) {
-	e := newFaultEnv(t, 3)
+	e := newFaultEnv(t, 3, durable)
 	e.proxy.Add(testutil.Fault{Match: isPut, Kind: testutil.Status, Code: 503, Count: -1})
 	_, err := e.v.Put(context.Background(), "down/x.txt", strings.NewReader("hello"), 5, time.Now())
 	if err == nil {
@@ -244,7 +251,7 @@ func TestFaultLargeUploadDropped(t *testing.T) {
 // A Put whose context ends must leave nothing behind, whether it was still
 // waiting for its pack to go out or the commit had already taken it along.
 func TestCancelledPutLeavesNoTrace(t *testing.T) {
-	e := newFaultEnv(t, 2)
+	e := newFaultEnv(t, 2, durable)
 	ctx := context.Background()
 	old := randBytes(900)
 	if _, err := e.v.Put(ctx, "keep/a.dat", bytes.NewReader(old), int64(len(old)), time.Now()); err != nil {
@@ -300,4 +307,133 @@ func TestCancelledPutLeavesNoTrace(t *testing.T) {
 		}
 	}
 	t.Logf("calls: %s", e.meter.Snapshot())
+}
+
+func durable(c *core.Config) { c.Ack = core.AckDurable }
+
+// A log segment whose upload lands on the drive but is reported as failed (the
+// connection drops before the answer, and the drive can't be asked afterwards)
+// makes its commit give up. The metadata operations that rode in it must not
+// move to a later segment: a "remove x" replayed after a later "put x" would
+// delete the new x when the volume is rebuilt from the drive.
+func TestSegmentFailureKeepsMetadataOrder(t *testing.T) {
+	for _, mode := range ackModes {
+		t.Run(string(mode), func(t *testing.T) {
+			ctx := context.Background()
+			e := newFaultEnv(t, 2, func(c *core.Config) {
+				c.Ack = mode
+				c.SealQuiet, c.SealMax = time.Hour, time.Hour // seal only when the test says so
+			})
+			put := func(p string, d []byte) error {
+				_, err := e.v.Put(ctx, p, bytes.NewReader(d), int64(len(d)), time.Now())
+				return err
+			}
+			v1, v2, yData := randBytes(700), randBytes(900), randBytes(500)
+			go put("keep/x", v1) // durable: blocks until sealed; staged: returns at once
+			time.Sleep(100 * time.Millisecond)
+			if err := e.v.Flush(ctx); err != nil {
+				t.Fatal(err)
+			}
+
+			var target atomic.Value // the name of the first log segment uploaded from now on
+			segPut := func(r *http.Request) bool {
+				if r.Method != "PUT" || !strings.Contains(r.URL.Path, "/.cfs/log/") {
+					return false
+				}
+				target.CompareAndSwap(nil, r.URL.Path)
+				return r.URL.Path == target.Load()
+			}
+			probe := func(r *http.Request) bool {
+				t, _ := target.Load().(string)
+				return t != "" && r.URL.Path == t && r.Method != "PUT"
+			}
+			e.proxy.Add(testutil.Fault{Match: segPut, Kind: testutil.DropAfter, Count: -1})
+			// "Not found" is a definite answer: nothing retries it, rclone's pacer
+			// isn't slowed by it, and the volume can't tell that the upload landed.
+			e.proxy.Add(testutil.Fault{Match: probe, Kind: testutil.Status, Code: 404, Count: -1})
+
+			if err := e.v.Remove(ctx, "keep/x"); err != nil { // queued for the log, not sent yet
+				t.Fatal(err)
+			}
+			// Commit A: carries "remove x", and fails at its segment.
+			yErr := make(chan error, 1)
+			go func() { yErr <- put("keep/y", yData) }()
+			time.Sleep(100 * time.Millisecond)
+			aErr := make(chan error, 1)
+			go func() { aErr <- e.v.Flush(ctx) }()
+			deadline := time.Now().Add(20 * time.Second)
+			for target.Load() == nil {
+				if time.Now().After(deadline) {
+					t.Fatal("the commit never got to its segment")
+				}
+				time.Sleep(5 * time.Millisecond)
+			}
+			// While A is failing, a later commit B writes x again and lands.
+			bErr := make(chan error, 1)
+			go func() { bErr <- put("keep/x", v2) }()
+			time.Sleep(100 * time.Millisecond)
+			bFlush := make(chan error, 1)
+			go func() { bFlush <- e.v.Flush(ctx) }()
+			select {
+			case err := <-bErr:
+				if err != nil {
+					t.Fatalf("the write of x v2 failed: %v", err)
+				}
+			case <-time.After(20 * time.Second):
+				t.Fatal("the write of x v2 never returned")
+			}
+			if err := <-aErr; err == nil {
+				t.Fatal("the commit with the failing segment reported success")
+			}
+			<-bFlush
+			segName := filepath.Join(e.drive, filepath.FromSlash(strings.TrimPrefix(target.Load().(string), "/")))
+			if _, err := os.Stat(segName); err != nil {
+				t.Fatalf("the segment did not land on the drive, the scenario is not the one under test: %v", err)
+			}
+			e.proxy.Clear()
+			if mode == core.AckDurable {
+				if err := <-yErr; err == nil {
+					t.Fatal("durable: the put in the failed commit must report the failure")
+				}
+			}
+			if err := e.v.Flush(ctx); err != nil { // sends "remove x" under its own sequence number
+				t.Fatal(err)
+			}
+			wantY := mode == core.AckStaged // an acknowledged write is never lost; a failed one is gone
+			check := func(when string, v *core.Volume) {
+				t.Helper()
+				if got, err := readAllVol(v, "keep/x"); err != nil || !bytes.Equal(got, v2) {
+					t.Fatalf("%s: keep/x is not the second version: %v", when, err)
+				}
+				got, err := readAllVol(v, "keep/y")
+				if wantY && (err != nil || !bytes.Equal(got, yData)) {
+					t.Fatalf("%s: acknowledged keep/y is missing: %v", when, err)
+				}
+				if !wantY && err == nil {
+					t.Fatalf("%s: keep/y exists although its put failed", when)
+				}
+			}
+			check("live", e.v)
+			rep, err := e.v.Fsck(ctx, core.FsckOpts{Deep: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, p := range rep.Problems {
+				if p.Kind != "orphan_pack" {
+					t.Fatalf("fsck: %s", p)
+				}
+			}
+			// What the drive replays to, with no local state.
+			e.v.Close(ctx)
+			st, _ := aspect.Stack(testutil.WebDAVStore(t, e.proxy.URL), aspect.Options{})
+			cfg := testutil.FastConfig(t.TempDir())
+			cfg.Threshold = 64 << 10
+			v3, err := core.Open(ctx, st, cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer v3.Close(ctx)
+			check("rebuilt from the drive", v3)
+		})
+	}
 }

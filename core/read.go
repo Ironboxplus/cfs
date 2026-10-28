@@ -6,8 +6,10 @@ import (
 	"context"
 	"crypto/sha1"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
+	"os"
 
 	"github.com/Ironboxplus/cfs/store"
 )
@@ -28,13 +30,20 @@ func (v *Volume) Open(ctx context.Context, p string, off, n int64) (io.ReadClose
 	if off < 0 {
 		off = 0
 	}
-	r, ok, err := v.ix.get(p)
-	if err != nil {
-		return nil, err
-	}
-	if ok {
+	for try := 0; ; try++ {
+		r, ok, err := v.ix.get(p)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			break
+		}
 		data, err := v.memberBytes(ctx, r)
 		if err != nil {
+			// The staged file went to its pack between the lookup and the read.
+			if r.Pack == "" && errors.Is(err, os.ErrNotExist) && try < 3 {
+				continue
+			}
 			return nil, err
 		}
 		return sliceReader(data, off, n), nil
@@ -107,6 +116,9 @@ func (c *chunkReader) Close() error { c.buf = nil; return nil }
 func (v *Volume) memberBytes(ctx context.Context, r fileRow) ([]byte, error) {
 	if r.Size == 0 {
 		return nil, nil
+	}
+	if r.Pack == "" {
+		return v.readStaged(r)
 	}
 	key := fmt.Sprintf("%s@%d", r.Pack, r.Off)
 	if d, ok := v.mc.get(key); ok {

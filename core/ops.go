@@ -51,10 +51,12 @@ func (v *Volume) bigAt(ctx context.Context, p string) (store.Entry, bool, error)
 }
 
 // Put writes a file. size is the exact length of r, or -1 if unknown. A file
-// below the threshold goes into a pack and Put returns once the pack and the
-// log segment describing it are durable on the drive (and are visible); a
-// larger file is uploaded to its own path directly. Put returns only when the
-// data is where it will be read from.
+// below the threshold goes into a pack. With AckStaged (the default) Put
+// returns once the data is fsynced in the local staging area, from where it is
+// readable at once and packed and uploaded in the background; with AckDurable
+// it returns once the pack and the log segment describing it are on the drive.
+// A larger file is uploaded to its own path directly and Put returns when that
+// is done.
 func (v *Volume) Put(ctx context.Context, p string, r io.Reader, size int64, mtime time.Time) (Entry, error) {
 	p, err := clean(p)
 	if err != nil {
@@ -121,6 +123,9 @@ func (v *Volume) Put(ctx context.Context, p string, r io.Reader, size int64, mti
 }
 
 func (v *Volume) putSmall(ctx context.Context, p string, data []byte, mtime time.Time, stray bool) (Entry, error) {
+	if v.cfg.Ack == AckStaged {
+		return v.putStaged(ctx, p, data, mtime, stray)
+	}
 	sum := sha1.Sum(data)
 	m := &member{path: p, size: int64(len(data)), mtime: mtime.UnixNano(), sha1: hex.EncodeToString(sum[:]), strayBig: stray}
 	stored, meth, crc := v.encodeMember(p, data)
@@ -155,8 +160,25 @@ func (v *Volume) putSmall(ctx context.Context, p string, data []byte, mtime time
 }
 
 func (v *Volume) putLarge(ctx context.Context, p string, r io.Reader, size int64, mtime time.Time) (Entry, error) {
+	// A small version of the name that is still staged has to be in the log
+	// before this write removes it (below).
+	if err := v.waitConflicts(ctx, func(q string) bool { return q == p }); err != nil {
+		return Entry{}, err
+	}
 	if err := v.mkdirAll(ctx, parentOf(p)); err != nil {
 		return Entry{}, err
+	}
+	// If a small version of the name exists, the upload makes it obsolete, and
+	// the index has to follow: journal that, so a crash between the upload and
+	// the index change doesn't leave the small file shadowing the new one.
+	_, hadSmall, err := v.ix.get(p)
+	if err != nil {
+		return Entry{}, err
+	}
+	if hadSmall {
+		if err := v.ix.kvSet(putBigKey+p, "1"); err != nil {
+			return Entry{}, err
+		}
 	}
 	var src store.Source = store.Once(r)
 	if rs, ok := r.(io.ReadSeeker); ok {
@@ -182,6 +204,9 @@ func (v *Volume) putLarge(ctx context.Context, p string, r io.Reader, size int64
 		if err := v.localOp(metalog.Record{Op: metalog.OpDel, Path: p}); err != nil {
 			return Entry{}, err
 		}
+	}
+	if hadSmall {
+		v.ix.db.Exec("DELETE FROM kv WHERE k=?", putBigKey+p)
 	}
 	e := store.Entry{Path: p, Size: size, ModTime: mtime}
 	v.dc.cacheAdd(e)
@@ -315,6 +340,11 @@ func (v *Volume) Move(ctx context.Context, src, dst string) error {
 		return store.ErrIsDir
 	}
 	_ = srcRow
+	// The move takes several steps on the drive and in the index. Journal it
+	// first: after a crash in the middle, the next start completes it.
+	if err := v.setMvIntent(src, dst); err != nil {
+		return err
+	}
 	if srcSmall {
 		if dstIsBig {
 			if err := v.st.Remove(ctx, dst); err != nil && !isNotFound(err) {
@@ -348,7 +378,60 @@ func (v *Volume) Move(ctx context.Context, src, dst string) error {
 		ne.Path = dst
 		v.dc.cacheAdd(ne)
 	}
+	v.clearMvIntent(dst)
 	return nil
+}
+
+// mvIntent is a Move that has started.
+type mvIntent struct{ Src, Dst string }
+
+// mvKey prefixes the kv rows that journal moves in progress, one per target.
+const mvKey = "mv:"
+
+func (v *Volume) setMvIntent(src, dst string) error {
+	b, _ := json.Marshal(mvIntent{src, dst})
+	return v.ix.kvSet(mvKey+dst, string(b))
+}
+
+func (v *Volume) clearMvIntent(dst string) {
+	if _, err := v.ix.db.Exec("DELETE FROM kv WHERE k=?", mvKey+dst); err != nil {
+		v.logf("cfs: clear move journal for %s: %v", dst, err)
+	}
+}
+
+// finishMove carries an interrupted Move to its end. Every step is safe to
+// repeat: a source that is already gone means the move is done.
+func (v *Volume) finishMove(ctx context.Context, in mvIntent) error {
+	if _, ok, err := v.ix.getCommitted(in.Src); err != nil {
+		return err
+	} else if ok { // a small source
+		if e, err := v.st.Stat(ctx, in.Dst); err == nil && !e.IsDir {
+			if err := v.st.Remove(ctx, in.Dst); err != nil && !isNotFound(err) {
+				return err
+			}
+			v.dc.cacheDel(in.Dst)
+		}
+		return v.localOp(metalog.Record{Op: metalog.OpMv, Path: in.Src, To: in.Dst})
+	}
+	if e, err := v.st.Stat(ctx, in.Src); err != nil || e.IsDir { // gone: it was done
+		return nil
+	}
+	if _, ok, err := v.ix.getCommitted(in.Dst); err != nil {
+		return err
+	} else if ok {
+		if err := v.localOp(metalog.Record{Op: metalog.OpDel, Path: in.Dst}); err != nil {
+			return err
+		}
+	}
+	if e, err := v.st.Stat(ctx, in.Dst); err == nil && !e.IsDir {
+		if err := v.st.Remove(ctx, in.Dst); err != nil && !isNotFound(err) {
+			return err
+		}
+	}
+	if err := v.mkdirAll(ctx, parentOf(in.Dst)); err != nil {
+		return err
+	}
+	return v.st.Move(ctx, in.Src, in.Dst)
 }
 
 // SetModTime sets the modification time of a file.
@@ -527,36 +610,13 @@ func (v *Volume) flushMeta(ctx context.Context) error {
 			return err
 		}
 	}
-	n := 0
-	if err := v.ix.db.QueryRow("SELECT count(*) FROM pending WHERE seg IS NULL").Scan(&n); err != nil {
-		return err
-	}
-	if n == 0 {
-		return nil
-	}
 	v.ckptMu.RLock()
 	defer v.ckptMu.RUnlock()
-	seq, err := v.ix.allocSeq()
-	if err != nil {
-		return err
-	}
-	key := segKeyOf(v.epoch, seq)
-	var rows []pendingRow
-	err = v.ix.tx(func(tx *sql.Tx) error {
-		var err error
-		if rows, err = readPending(tx, "WHERE seg IS NULL"); err != nil {
-			return err
-		}
-		if _, err = tx.Exec("UPDATE pending SET seg=? WHERE seg IS NULL", key); err != nil {
-			return err
-		}
-		_, err = tx.Exec("INSERT OR IGNORE INTO segs(name) VALUES(?)", key)
-		return err
-	})
+	seq, rows, err := v.ix.sealPending(v.epoch, false, true)
 	if err != nil || len(rows) == 0 {
 		return err
 	}
-	return v.uploadMetaSeg(ctx, key, rows)
+	return v.uploadMetaSeg(ctx, segKeyOf(v.epoch, seq), rows)
 }
 
 func (v *Volume) uploadMetaSeg(ctx context.Context, key string, rows []pendingRow) error {
@@ -662,3 +722,7 @@ func (v *Volume) undoPut(m *member, pack string) {
 	}
 	v.dc.cacheDel(m.path)
 }
+
+// putBigKey prefixes the kv rows that say a large file is being uploaded over a
+// name that has a small version.
+const putBigKey = "putbig:"

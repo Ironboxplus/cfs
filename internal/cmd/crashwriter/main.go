@@ -55,6 +55,8 @@ func main() {
 		meta      = flag.Int("meta", 1, "meta inflight")
 		pause     = flag.Duration("pause", 0, "pause between operations")
 		ckpt      = flag.Int("ckpt", 0, "checkpoint every N segments (0: default)")
+		ack       = flag.String("ack", "", "ack mode: staged or durable (default: the volume's)")
+		packFiles = flag.Int("packfiles", 0, "seal a pack at this many files (0: default); small values make many packs")
 	)
 	flag.Parse()
 	ctx := context.Background()
@@ -71,6 +73,12 @@ func main() {
 	cfg.Pipeline = *transfers
 	if *ckpt != 0 {
 		cfg.CheckpointEvery = *ckpt
+	}
+	if *ack != "" {
+		cfg.Ack = core.AckMode(*ack)
+	}
+	if *packFiles > 0 {
+		cfg.PackMaxFiles = *packFiles
 	}
 	v, err := core.Open(ctx, st, cfg)
 	if err != nil {

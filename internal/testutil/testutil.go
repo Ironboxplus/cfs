@@ -5,6 +5,7 @@ package testutil
 
 import (
 	"context"
+	"os"
 	"testing"
 	"time"
 
@@ -31,6 +32,9 @@ func LocalStore(t testing.TB, dir string) store.Store {
 // FastConfig is a configuration with short timers for tests.
 func FastConfig(stateDir string) core.Config {
 	return core.Config{
+		// CFS_TEST_ACK=durable runs a whole suite in the strict mode; the default
+		// is the volume's own (staged).
+		Ack:       core.AckMode(os.Getenv("CFS_TEST_ACK")),
 		StateDir:  stateDir,
 		SealQuiet: 40 * time.Millisecond,
 		SealMax:   400 * time.Millisecond,

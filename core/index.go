@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"unicode/utf8"
 
 	"github.com/Ironboxplus/cfs/metalog"
@@ -54,6 +55,17 @@ CREATE TABLE IF NOT EXISTS pending(
 );
 CREATE TABLE IF NOT EXISTS segs(name TEXT PRIMARY KEY);
 CREATE TABLE IF NOT EXISTS inflight(name TEXT PRIMARY KEY);
+CREATE TABLE IF NOT EXISTS staged(
+  path  TEXT PRIMARY KEY,
+  dir   TEXT NOT NULL,
+  name  TEXT NOT NULL,
+  id    INTEGER NOT NULL,
+  size  INTEGER NOT NULL,
+  mtime INTEGER NOT NULL,
+  sha1  TEXT NOT NULL,
+  stray INTEGER NOT NULL DEFAULT 0
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS staged_dir ON staged(dir);
 `
 
 func openIndex(dir string) (*index, error) {
@@ -128,9 +140,39 @@ func getFile(q queryer, p string) (fileRow, bool, error) {
 	return r, err == nil, err
 }
 
-func (ix *index) get(p string) (fileRow, bool, error) { return getFile(ix.db, p) }
+// getCommitted returns the row of a file as the drive's log has it.
+func (ix *index) getCommitted(p string) (fileRow, bool, error) { return getFile(ix.db, p) }
 
-func (ix *index) listDir(dir string) ([]fileRow, error) {
+// A staged file is a small file that was acknowledged but isn't in a pack on
+// the drive yet. The namespace readers see is the committed rows overlaid with
+// the staged ones; a staged row has an empty Pack and the stage id in Off.
+func stagedRow(s scanner) (fileRow, error) {
+	var r fileRow
+	var stray int
+	err := s.Scan(&r.Path, &r.Dir, &r.Name, &r.Off, &r.Size, &r.MTime, &r.SHA1, &stray)
+	r.CSize = r.Size
+	return r, err
+}
+
+const stagedCols = "path,dir,name,id,size,mtime,sha1,stray"
+
+func getStaged(q queryer, p string) (fileRow, bool, error) {
+	r, err := stagedRow(q.QueryRow("SELECT "+stagedCols+" FROM staged WHERE path=?", p))
+	if err == sql.ErrNoRows {
+		return fileRow{}, false, nil
+	}
+	return r, err == nil, err
+}
+
+// get returns the file at p as readers see it: staged data first.
+func (ix *index) get(p string) (fileRow, bool, error) {
+	if r, ok, err := getStaged(ix.db, p); err != nil || ok {
+		return r, ok, err
+	}
+	return getFile(ix.db, p)
+}
+
+func (ix *index) listDirCommitted(dir string) ([]fileRow, error) {
 	rows, err := ix.db.Query("SELECT "+fileCols+" FROM files WHERE dir=?", dir)
 	if err != nil {
 		return nil, err
@@ -145,6 +187,44 @@ func (ix *index) listDir(dir string) ([]fileRow, error) {
 		out = append(out, r)
 	}
 	return out, rows.Err()
+}
+
+// listDir lists the small files of dir as readers see them.
+func (ix *index) listDir(dir string) ([]fileRow, error) {
+	out, err := ix.listDirCommitted(dir)
+	if err != nil {
+		return nil, err
+	}
+	srows, err := ix.db.Query("SELECT "+stagedCols+" FROM staged WHERE dir=?", dir)
+	if err != nil {
+		return nil, err
+	}
+	defer srows.Close()
+	var staged []fileRow
+	for srows.Next() {
+		r, err := stagedRow(srows)
+		if err != nil {
+			return nil, err
+		}
+		staged = append(staged, r)
+	}
+	if err := srows.Err(); err != nil {
+		return nil, err
+	}
+	if len(staged) == 0 {
+		return out, nil
+	}
+	hide := make(map[string]bool, len(staged))
+	for _, r := range staged {
+		hide[r.Name] = true
+	}
+	kept := out[:0]
+	for _, r := range out {
+		if !hide[r.Name] {
+			kept = append(kept, r)
+		}
+	}
+	return append(kept, staged...), nil
 }
 
 // underRange is the key range of everything below directory p.
@@ -172,10 +252,52 @@ func (ix *index) anyUnder(p string) (bool, error) {
 	lo, hi := underRange(p)
 	var one int
 	err := ix.db.QueryRow("SELECT 1 FROM files WHERE path>=? AND path<? LIMIT 1", lo, hi).Scan(&one)
+	if err == nil {
+		return true, nil
+	}
+	if err != sql.ErrNoRows {
+		return false, err
+	}
+	err = ix.db.QueryRow("SELECT 1 FROM staged WHERE path>=? AND path<? LIMIT 1", lo, hi).Scan(&one)
 	if err == sql.ErrNoRows {
 		return false, nil
 	}
 	return err == nil, err
+}
+
+// stagedDirs returns the names of the subdirectories of dir that hold staged
+// files: a directory a staged file lives in is only created on the drive when
+// its pack is committed, but readers must see it from the moment of the Put.
+func (ix *index) stagedDirs(dir string) ([]string, error) {
+	var rows *sql.Rows
+	var err error
+	if dir == "" {
+		rows, err = ix.db.Query("SELECT DISTINCT dir FROM staged WHERE dir<>''")
+	} else {
+		lo, hi := underRange(dir)
+		rows, err = ix.db.Query("SELECT DISTINCT dir FROM staged WHERE dir>=? AND dir<?", lo, hi)
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	seen := map[string]bool{}
+	var out []string
+	for rows.Next() {
+		var d string
+		if err := rows.Scan(&d); err != nil {
+			return nil, err
+		}
+		if dir != "" {
+			d = d[len(dir)+1:]
+		}
+		name, _, _ := strings.Cut(d, "/")
+		if !seen[name] {
+			seen[name] = true
+			out = append(out, name)
+		}
+	}
+	return out, rows.Err()
 }
 
 func (ix *index) all(f func(fileRow) error) error {
@@ -236,6 +358,51 @@ func (ix *index) allocSeq() (uint64, error) {
 		return kvSet(tx, "next_seq", strconv.FormatUint(n+1, 10))
 	})
 	return n, err
+}
+
+// sealPending reserves the next sequence number and seals every queued
+// metadata row under it, in one transaction. Doing both at once is what keeps
+// the log in the order the operations were issued: a segment never carries a
+// row that is older than a row of a segment with a lower number, whichever of
+// several concurrent committers got there first. With inflight, the segment
+// is also marked as being committed by this process. With onlyIfAny, nothing
+// is reserved when no row is queued (seq 0).
+func (ix *index) sealPending(epoch uint64, inflight, onlyIfAny bool) (seq uint64, rows []pendingRow, err error) {
+	err = ix.tx(func(tx *sql.Tx) error {
+		var err error
+		seq, rows = 0, nil
+		if rows, err = readPending(tx, "WHERE seg IS NULL"); err != nil {
+			return err
+		}
+		if onlyIfAny && len(rows) == 0 {
+			return nil
+		}
+		var s string
+		seq = 1
+		switch err := tx.QueryRow("SELECT v FROM kv WHERE k='next_seq'").Scan(&s); {
+		case err == nil:
+			seq, _ = strconv.ParseUint(s, 10, 64)
+		case err != sql.ErrNoRows:
+			return err
+		}
+		if err := kvSet(tx, "next_seq", strconv.FormatUint(seq+1, 10)); err != nil {
+			return err
+		}
+		key := segKeyOf(epoch, seq)
+		if len(rows) > 0 {
+			if _, err := tx.Exec("UPDATE pending SET seg=? WHERE seg IS NULL", key); err != nil {
+				return err
+			}
+		}
+		if _, err := tx.Exec("INSERT OR IGNORE INTO segs(name) VALUES(?)", key); err != nil {
+			return err
+		}
+		if inflight {
+			_, err = tx.Exec("INSERT OR IGNORE INTO inflight(name) VALUES(?)", key)
+		}
+		return err
+	})
+	return
 }
 
 // raiseSeq makes sure the next allocated number is above n.
@@ -354,4 +521,15 @@ func readPending(q queryer, where string, args ...any) ([]pendingRow, error) {
 		out = append(out, p)
 	}
 	return out, rows.Err()
+}
+
+// anyStagedUnder reports whether a staged file lives below directory p.
+func (ix *index) anyStagedUnder(p string) (bool, error) {
+	lo, hi := underRange(p)
+	var one int
+	err := ix.db.QueryRow("SELECT 1 FROM staged WHERE path>=? AND path<? LIMIT 1", lo, hi).Scan(&one)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	return err == nil, err
 }

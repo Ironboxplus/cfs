@@ -13,6 +13,7 @@ import (
 	"regexp"
 	"sort"
 	"strconv"
+	"strings"
 
 	"github.com/Ironboxplus/cfs/metalog"
 	"github.com/Ironboxplus/cfs/store"
@@ -61,7 +62,7 @@ func (v *Volume) fetchBaseCheckpoint(ctx context.Context, dbPath string) error {
 				err = ix.tx(func(tx *sql.Tx) error {
 					for _, q := range []string{
 						"DELETE FROM kv WHERE k IN ('writer_id','epoch','inited','dmv_intent')",
-						"DELETE FROM pending", "DELETE FROM inflight",
+						"DELETE FROM pending", "DELETE FROM inflight", "DELETE FROM staged",
 					} {
 						if _, err := tx.Exec(q); err != nil {
 							return err
@@ -242,13 +243,18 @@ func (v *Volume) recoverLocal(ctx context.Context) error {
 				if !v.ReadOnly() {
 					_ = v.log.DeleteSegment(ctx, ref)
 				}
-				v.unseal(key)
+				v.releaseInflight(key)
 				continue
 			}
 			err = v.ix.tx(func(tx *sql.Tx) error {
 				for _, r := range seg.Records {
 					if r.Op == metalog.OpPut {
 						if err := applyRecord(tx, r, seg.Seq); err != nil {
+							return err
+						}
+						// The staged copy is on the drive now: nothing to replay.
+						if _, err := tx.Exec("DELETE FROM staged WHERE path=? AND sha1=? AND size=? AND mtime=?",
+							r.Path, r.SHA1, r.Size, r.MTime); err != nil {
 							return err
 						}
 					}
@@ -268,7 +274,7 @@ func (v *Volume) recoverLocal(ctx context.Context) error {
 			}
 			v.logf("cfs: recovered pack %s committed before the crash", seg.Pack)
 		} else {
-			v.unseal(key)
+			v.releaseInflight(key)
 		}
 	}
 	// Sealed metadata segments that did reach the drive need no more upload.
@@ -283,7 +289,8 @@ func (v *Volume) recoverLocal(ctx context.Context) error {
 			}
 		}
 	}
-	return nil
+	// With the index complete: what was half done on the drive.
+	return v.finishInterrupted(ctx)
 }
 
 // Refresh applies segments written to the drive by the writer since this
@@ -430,6 +437,69 @@ func (v *Volume) recoverFromPacks(ctx context.Context) error {
 		}
 		seg := metalog.Segment{Epoch: p.epoch, Seq: p.seq, Pack: p.name, PackBytes: p.size, PackN: len(pm.Members), Records: pm.Members}
 		if err := v.applySegment(seg); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// finishInterrupted completes what a crash left half done on the drive and in
+// the index: removals of large files shadowed by a packed file, and moves.
+func (v *Volume) finishInterrupted(ctx context.Context) error {
+	if v.ReadOnly() {
+		return nil
+	}
+	rows, err := v.ix.db.Query("SELECT k, v FROM kv WHERE k LIKE 'stray:%' OR k LIKE 'mv:%' OR k LIKE 'putbig:%'")
+	if err != nil {
+		return err
+	}
+	type kvp struct{ k, v string }
+	var todo []kvp
+	for rows.Next() {
+		var x kvp
+		if err := rows.Scan(&x.k, &x.v); err != nil {
+			rows.Close()
+			return err
+		}
+		todo = append(todo, x)
+	}
+	rows.Close()
+	for _, x := range todo {
+		switch {
+		case strings.HasPrefix(x.k, strayKey):
+			p := strings.TrimPrefix(x.k, strayKey)
+			// Only while the packed file is still the one the name stands for:
+			// a large file written since is the new version.
+			if _, ok, err := v.ix.getCommitted(p); err != nil {
+				return err
+			} else if ok {
+				if err := v.st.Remove(ctx, p); err != nil && !isNotFound(err) {
+					return fmt.Errorf("cfs: remove shadowed large file %s: %w", p, err)
+				}
+			}
+		case strings.HasPrefix(x.k, putBigKey):
+			// The large upload was never acknowledged (the key goes before the
+			// acknowledgement), and it may be whole, partial or absent: take it
+			// back, the small version stays what the name stands for.
+			p := strings.TrimPrefix(x.k, putBigKey)
+			if _, ok, err := v.ix.getCommitted(p); err != nil {
+				return err
+			} else if ok {
+				if err := v.st.Remove(ctx, p); err != nil && !isNotFound(err) {
+					return fmt.Errorf("cfs: remove unacknowledged large file %s: %w", p, err)
+				}
+			}
+		case strings.HasPrefix(x.k, mvKey):
+			var in mvIntent
+			if err := json.Unmarshal([]byte(x.v), &in); err != nil {
+				return err
+			}
+			if err := v.finishMove(ctx, in); err != nil {
+				return fmt.Errorf("cfs: finish interrupted move %s -> %s: %w", in.Src, in.Dst, err)
+			}
+			v.logf("cfs: completed interrupted move %s -> %s", in.Src, in.Dst)
+		}
+		if _, err := v.ix.db.Exec("DELETE FROM kv WHERE k=?", x.k); err != nil {
 			return err
 		}
 	}
