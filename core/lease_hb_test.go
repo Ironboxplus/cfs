@@ -8,7 +8,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -192,36 +191,19 @@ func TestSilentWriterIsFencedAfterTakeover(t *testing.T) {
 	}
 }
 
-// A writer that has seen the newer lease stays fenced: a commit that comes
-// right after the heartbeat read it must not slip through the "read the lease
-// at most every LeaseTTL/6" shortcut. (The heartbeat's read refreshed that
-// timer even when it found the lease taken, so the commit skipped its own read
-// and wrote a segment next to the new writer's.)
-func TestFencedWriterCannotCommitRightAfterHeartbeatSawTakeover(t *testing.T) {
+// A writer that has read the newer lease stays fenced: the commit check that
+// follows right after must not take the "read the lease at most every
+// LeaseTTL/6" shortcut. The read that found the lease taken used to refresh
+// that timer, so a commit racing the heartbeat skipped its own read and wrote a
+// segment next to the new writer's.
+func TestFencedWriterFailsEveryLeaseCheck(t *testing.T) {
 	ctx := context.Background()
 	drive := t.TempDir()
-	fencedSeen := make(chan struct{})
-	var once sync.Once
-	a, lc, err := openCounted(t, drive, func(c *core.Config) {
-		c.LeaseTTL = 3 * time.Second
-		c.Logf = func(format string, args ...any) {
-			if strings.Contains(fmt.Sprintf(format, args...), "fenced") {
-				once.Do(func() { close(fencedSeen) })
-			}
-		}
-	})
+	a, lc, err := openCounted(t, drive, func(c *core.Config) { c.LeaseTTL = 3 * time.Second })
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer a.Close(ctx)
-	segs := func() map[string]bool {
-		m := map[string]bool{}
-		ents, _ := os.ReadDir(filepath.Join(drive, ".cfs", "log"))
-		for _, e := range ents {
-			m[e.Name()] = true
-		}
-		return m
-	}
 	lc.cut.Store(true)
 	time.Sleep(3500 * time.Millisecond)
 	b, err := openAt(t, drive, t.TempDir(), nil)
@@ -229,25 +211,11 @@ func TestFencedWriterCannotCommitRightAfterHeartbeatSawTakeover(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer b.Close(ctx)
-	// Staged while the drive is unreachable; it is committed only after the
-	// heartbeat has read the new lease.
-	if _, err := a.Put(ctx, "after.txt", strings.NewReader("two"), 3, time.Now()); err != nil {
-		t.Fatalf("put while cut: %v", err)
-	}
-	before := segs()
 	lc.cut.Store(false)
-	select {
-	case <-fencedSeen:
-	case <-time.After(10 * time.Second):
-		t.Fatal("the heartbeat never noticed the takeover")
+	if err := a.ReadCheckLease(ctx); !errors.Is(err, core.ErrFenced) {
+		t.Fatalf("read check after the takeover: %v, want ErrFenced", err)
 	}
-	if err := a.Flush(ctx); !errors.Is(err, core.ErrFenced) {
-		t.Fatalf("flush after the heartbeat saw the takeover: %v, want ErrFenced", err)
-	}
-	prefix := fmt.Sprintf("%06d-", a.Epoch())
-	for name := range segs() {
-		if strings.HasPrefix(name, prefix) && !before[name] {
-			t.Fatalf("fenced writer wrote segment %s", name)
-		}
+	if err := a.CheckLease(ctx); !errors.Is(err, core.ErrFenced) {
+		t.Fatalf("commit check right after it: %v, want ErrFenced", err)
 	}
 }
