@@ -148,7 +148,9 @@ func (v *Volume) catchUp(ctx context.Context) error {
 			if i == len(refs)-1 && !errors.Is(err, store.ErrNotFound) && ctx.Err() == nil {
 				v.logf("cfs: ignoring unreadable newest log segment %s (an interrupted upload): %v", ref.Name, err)
 				if !v.ReadOnly() && !v.fenced.Load() {
-					_ = v.log.DeleteSegment(ctx, ref)
+					if derr := v.log.DeleteSegment(ctx, ref); derr != nil {
+						v.logf("cfs: could not remove unreadable log segment %s: %v", ref.Name, derr)
+					}
 				}
 				continue
 			}
@@ -251,7 +253,9 @@ func (v *Volume) recoverLocal(ctx context.Context) error {
 				// never acknowledged. Remove the debris and give the rows back.
 				v.logf("cfs: log segment %s of an interrupted commit is unreadable, discarding it: %v", ref.Name, err)
 				if !v.ReadOnly() {
-					_ = v.log.DeleteSegment(ctx, ref)
+					if derr := v.log.DeleteSegment(ctx, ref); derr != nil {
+						v.logf("cfs: could not remove unreadable log segment %s: %v", ref.Name, derr)
+					}
 				}
 				v.releaseInflight(key)
 				continue

@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -312,6 +313,15 @@ func openVol(t *testing.T, drive, state string, tweak func(*core.Config)) (*core
 	cfg := testutil.FastConfig(state)
 	cfg.Threshold = 256 << 10
 	cfg.LeaseTTL = 2 * time.Second
+	// The volume's own diagnostics, for as long as the test runs (a background
+	// goroutine may still log after it ended).
+	var ended atomic.Bool
+	t.Cleanup(func() { ended.Store(true) })
+	cfg.Logf = func(format string, args ...any) {
+		if !ended.Load() {
+			t.Logf(format, args...)
+		}
+	}
 	if tweak != nil {
 		tweak(&cfg)
 	}
@@ -536,6 +546,7 @@ func randomKills(t *testing.T, mode core.AckMode) {
 		ev := readEvents(t, events)
 		t.Logf("round %d: killed after %v (exit %d), %d events", r, kill, code, len(ev))
 		m := buildModel(ev)
+		logSegments(t, drive)
 		v, closeV := openVol(t, drive, state, ackTweak(mode))
 		m.verify(t, v, true)
 		fsckClean(t, v, true, ev...)
@@ -551,6 +562,20 @@ func randomKills(t *testing.T, mode core.AckMode) {
 
 var _ = sort.Strings
 var _ store.Entry
+
+// logSegments lists the drive's log segments with their sizes: a failed check
+// after a kill needs to know what the kill left behind.
+func logSegments(t *testing.T, drive string) {
+	segs, _ := filepath.Glob(filepath.Join(drive, ".cfs", "log", "*"))
+	sort.Strings(segs)
+	var b strings.Builder
+	for _, s := range segs {
+		if fi, err := os.Stat(s); err == nil {
+			fmt.Fprintf(&b, " %s=%d", filepath.Base(s), fi.Size())
+		}
+	}
+	t.Logf("log segments after the kill:%s", b.String())
+}
 
 // partialUpload: the drive below is a local directory, and rclone's local
 // backend writes a file at its final name while it uploads it. A large file
