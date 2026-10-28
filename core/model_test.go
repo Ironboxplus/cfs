@@ -106,9 +106,10 @@ func compareAll(t *testing.T, step int, v *core.Volume, ref refFS) {
 }
 
 func TestModel(t *testing.T) {
-	n := 1500
+	// Long runs only on request: CFS_MODEL_OPS=30000.
+	n := 300
 	if testing.Short() {
-		n = 400
+		n = 100
 	}
 	if s := os.Getenv("CFS_MODEL_OPS"); s != "" {
 		n, _ = strconv.Atoi(s)

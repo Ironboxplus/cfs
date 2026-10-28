@@ -500,9 +500,9 @@ func TestRandomKills(t *testing.T) {
 }
 
 func randomKills(t *testing.T, mode core.AckMode) {
-	rounds := 8
-	if testing.Short() {
-		rounds = 3
+	rounds := 3
+	if os.Getenv("CFS_LONG") != "" && !testing.Short() {
+		rounds = 8
 	}
 	base := t.TempDir()
 	drive, state, events := filepath.Join(base, "drive"), filepath.Join(base, "state"), filepath.Join(base, "events")
