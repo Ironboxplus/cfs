@@ -42,6 +42,11 @@ type probe struct {
 	delay time.Duration
 	// slow, when > 0, is the most a single Read of a body returns.
 	slow int
+	// putHook, when set, is called with every Put; it returns how long the Put
+	// stays on its way to the drive. The write then lands whatever happens to the
+	// caller's context: a request that has reached the server is not taken back by
+	// the client giving up.
+	putHook func(path string, src store.Source) time.Duration
 	// cut, when set, says after how many bytes the body of that Open fails
 	// (seq counts the Opens of the path so far, from 0); < 0: never.
 	cut func(path string, off int64, seq int) int64
@@ -109,6 +114,15 @@ func (b *probeBody) Read(buf []byte) (int, error) {
 }
 
 func (b *probeBody) Close() error { return b.rc.Close() }
+
+func (p *probe) Put(ctx context.Context, path string, src store.Source, o store.PutOpts) error {
+	if p.putHook == nil {
+		return p.Store.Put(ctx, path, src, o)
+	}
+	d := p.putHook(path, src)
+	time.Sleep(d)
+	return p.Store.Put(context.WithoutCancel(ctx), path, src, o)
+}
 
 func (p *probe) reset() {
 	p.mu.Lock()
