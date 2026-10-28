@@ -151,6 +151,7 @@ func (s *Server) Quit(t testing.TB) {
 	s.rc("core/quit", map[string]any{})
 	select {
 	case <-s.done:
+		t.Logf("server quit; its cfs log lines:\n%s", cfsLines(s.LogAll()))
 	case <-time.After(2 * time.Minute):
 		t.Fatalf("server did not quit:\n%s", s.LogTail())
 	}
@@ -184,4 +185,16 @@ func (s *Server) Cmd(t testing.TB, name string, opt map[string]string) map[strin
 	}
 	res, _ := out["result"].(map[string]any)
 	return res
+}
+
+// cfsLines keeps the lines of a server log that say something about the
+// volume (lease, close, checkpoint), for tests that look at what a quit did.
+func cfsLines(log string) string {
+	var keep []string
+	for _, l := range strings.Split(log, "\n") {
+		if strings.Contains(l, "cfs:") && !strings.Contains(l, "Failed to copy") {
+			keep = append(keep, l)
+		}
+	}
+	return strings.Join(keep, "\n")
 }

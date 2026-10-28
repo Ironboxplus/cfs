@@ -421,7 +421,9 @@ func (v *Volume) releaseLease(ctx context.Context) error {
 	v.leaseMu.Lock()
 	defer v.leaseMu.Unlock()
 	v.leaseDone = true
-	return v.writeLease(ctx, true)
+	err := v.writeLease(ctx, true)
+	v.logf("cfs: lease released (epoch %d): %v", v.epoch, err)
+	return err
 }
 
 // checkLease re-reads the lease and fences this writer if a newer epoch or a
