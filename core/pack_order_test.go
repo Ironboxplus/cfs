@@ -5,6 +5,7 @@ import (
 	"io"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -16,20 +17,20 @@ import (
 // packGate holds the first pack upload until released.
 type packGate struct {
 	store.Store
-	once    sync.Once
+	first   atomic.Bool
 	entered chan struct{}
 	release chan struct{}
 }
 
 func (g *packGate) Put(ctx context.Context, p string, src store.Source, o store.PutOpts) error {
 	if strings.HasPrefix(p, core.CtlDir+"/packs/") {
-		g.once.Do(func() {
+		if g.first.CompareAndSwap(false, true) { // not sync.Once: it would hold the other packs back too
 			close(g.entered)
 			select {
 			case <-g.release:
 			case <-ctx.Done():
 			}
-		})
+		}
 	}
 	return g.Store.Put(ctx, p, src, o)
 }
