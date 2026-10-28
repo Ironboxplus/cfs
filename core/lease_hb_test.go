@@ -1,7 +1,6 @@
 package core_test
 
 import (
-	"compress/gzip"
 	"context"
 	"errors"
 	"fmt"
@@ -143,37 +142,9 @@ func TestLeaseDefaultTTLWritesOnce(t *testing.T) {
 // A writer cut off from the drive for longer than the TTL is replaced; when the
 // network is back its next commit is fenced and writes no segment.
 func TestSilentWriterIsFencedAfterTakeover(t *testing.T) {
-	stop := make(chan struct{})
-	defer close(stop)
-	for i := 0; i < 4; i++ { // a busy runner: the scheduler gets slow, as on the CI hosts
-		go func() {
-			for {
-				select {
-				case <-stop:
-					return
-				default:
-				}
-			}
-		}()
-	}
-	for round := 0; round < 30; round++ {
-		t.Run(fmt.Sprintf("round%d", round), silentWriterRound)
-	}
-}
-
-func silentWriterRound(t *testing.T) {
 	ctx := context.Background()
 	drive := t.TempDir()
-	var lmu sync.Mutex
-	var logs []string
-	logf := func(who string) func(string, ...any) {
-		return func(format string, args ...any) {
-			lmu.Lock()
-			logs = append(logs, fmt.Sprintf("%s %s %s", time.Now().Format("15:04:05.000"), who, fmt.Sprintf(format, args...)))
-			lmu.Unlock()
-		}
-	}
-	a, lc, err := openCounted(t, drive, func(c *core.Config) { c.LeaseTTL = 3 * time.Second; c.Logf = logf("a") })
+	a, lc, err := openCounted(t, drive, func(c *core.Config) { c.LeaseTTL = 3 * time.Second })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -193,32 +164,10 @@ func silentWriterRound(t *testing.T) {
 		return m
 	}
 	before := segs()
-	dump := func() string {
-		var sb strings.Builder
-		fmt.Fprintf(&sb, "now %s; segments before: %v\n", time.Now().Format("15:04:05.000"), before)
-		ents, _ := os.ReadDir(filepath.Join(drive, ".cfs", "log"))
-		for _, e := range ents {
-			fi, _ := e.Info()
-			body := ""
-			if f, err := os.Open(filepath.Join(drive, ".cfs", "log", e.Name())); err == nil {
-				if zr, err := gzip.NewReader(f); err == nil {
-					b, _ := io.ReadAll(zr)
-					body = string(b)
-				}
-				f.Close()
-			}
-			fmt.Fprintf(&sb, "  %s written %s: %s\n", e.Name(), fi.ModTime().Format("15:04:05.000"), body)
-		}
-		lmu.Lock()
-		defer lmu.Unlock()
-		sb.WriteString(strings.Join(logs, "\n"))
-		return sb.String()
-	}
 
-	cutAt := time.Now()
 	lc.cut.Store(true)
 	time.Sleep(3500 * time.Millisecond) // longer than the TTL: the heartbeat can't run
-	b, err := openAt(t, drive, t.TempDir(), func(c *core.Config) { c.Logf = logf("b") })
+	b, err := openAt(t, drive, t.TempDir(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -227,19 +176,78 @@ func silentWriterRound(t *testing.T) {
 		t.Fatalf("takeover: readonly=%v epoch %d (silent writer had %d)", b.ReadOnly(), b.Epoch(), a.Epoch())
 	}
 	lc.cut.Store(false)
-	logf("test")("cut at %s, uncut now", cutAt.Format("15:04:05.000"))
 
 	_, err = a.Put(ctx, "after.txt", strings.NewReader("two"), 3, time.Now())
 	if err == nil {
 		err = a.Flush(ctx)
 	}
 	if !errors.Is(err, core.ErrFenced) {
-		t.Fatalf("silent writer's next commit: %v, want ErrFenced\n%s", err, dump())
+		t.Fatalf("silent writer's next commit: %v, want ErrFenced", err)
 	}
 	prefix := fmt.Sprintf("%06d-", a.Epoch())
 	for name := range segs() {
 		if strings.HasPrefix(name, prefix) && !before[name] {
-			t.Fatalf("fenced writer wrote segment %s\n%s", name, dump())
+			t.Fatalf("fenced writer wrote segment %s", name)
+		}
+	}
+}
+
+// A writer that has seen the newer lease stays fenced: a commit that comes
+// right after the heartbeat read it must not slip through the "read the lease
+// at most every LeaseTTL/6" shortcut. (The heartbeat's read refreshed that
+// timer even when it found the lease taken, so the commit skipped its own read
+// and wrote a segment next to the new writer's.)
+func TestFencedWriterCannotCommitRightAfterHeartbeatSawTakeover(t *testing.T) {
+	ctx := context.Background()
+	drive := t.TempDir()
+	fencedSeen := make(chan struct{})
+	var once sync.Once
+	a, lc, err := openCounted(t, drive, func(c *core.Config) {
+		c.LeaseTTL = 3 * time.Second
+		c.Logf = func(format string, args ...any) {
+			if strings.Contains(fmt.Sprintf(format, args...), "fenced") {
+				once.Do(func() { close(fencedSeen) })
+			}
+		}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close(ctx)
+	segs := func() map[string]bool {
+		m := map[string]bool{}
+		ents, _ := os.ReadDir(filepath.Join(drive, ".cfs", "log"))
+		for _, e := range ents {
+			m[e.Name()] = true
+		}
+		return m
+	}
+	lc.cut.Store(true)
+	time.Sleep(3500 * time.Millisecond)
+	b, err := openAt(t, drive, t.TempDir(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close(ctx)
+	// Staged while the drive is unreachable; it is committed only after the
+	// heartbeat has read the new lease.
+	if _, err := a.Put(ctx, "after.txt", strings.NewReader("two"), 3, time.Now()); err != nil {
+		t.Fatalf("put while cut: %v", err)
+	}
+	before := segs()
+	lc.cut.Store(false)
+	select {
+	case <-fencedSeen:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the heartbeat never noticed the takeover")
+	}
+	if err := a.Flush(ctx); !errors.Is(err, core.ErrFenced) {
+		t.Fatalf("flush after the heartbeat saw the takeover: %v, want ErrFenced", err)
+	}
+	prefix := fmt.Sprintf("%06d-", a.Epoch())
+	for name := range segs() {
+		if strings.HasPrefix(name, prefix) && !before[name] {
+			t.Fatalf("fenced writer wrote segment %s", name)
 		}
 	}
 }
