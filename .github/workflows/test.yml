@@ -1,0 +1,138 @@
+name: test
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      long:
+        description: "Also run the long job (CFS_LONG=1, 30000-op model, durable ack)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CGO_ENABLED: "0"
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # The job list lives in ci/groups.txt; this turns it into a matrix.
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.m.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: m
+        run: echo "matrix=$(bash ci/matrix.sh)" >> "$GITHUB_OUTPUT"
+
+  # Build, vet, format, and make sure every test belongs to a job.
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - name: rclone fork (v1.75.2 + ci/rclone-patches)
+        run: bash ci/setup-rclone.sh
+      - run: go build ./...
+      - run: GOOS=windows go build ./...
+      - run: GOOS=darwin go build ./...
+      - run: go vet ./...
+      - name: gofmt
+        run: |
+          out=$(gofmt -l .)
+          if [ -n "$out" ]; then echo "not formatted:"; echo "$out"; exit 1; fi
+      - name: every test is in a job
+        run: bash ci/check-groups.sh
+
+  test:
+    needs: plan
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - name: rclone fork (v1.75.2 + ci/rclone-patches)
+        run: bash ci/setup-rclone.sh
+      - name: go test
+        env:
+          PKGS: ${{ matrix.pkgs }}
+          RUN: ${{ matrix.run }}
+        run: |
+          set -o pipefail
+          go test -count=1 -timeout 20m -run "$RUN" $PKGS 2>&1 | tee "$RUNNER_TEMP/test.log"
+      - name: tail of the log
+        if: failure()
+        run: tail -c 200000 "$RUNNER_TEMP/test.log" > "$RUNNER_TEMP/test-tail.log" || true
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: log-${{ matrix.name }}-${{ matrix.os }}
+          path: ${{ runner.temp }}/test-tail.log
+          retention-days: 7
+          if-no-files-found: ignore
+
+  # Manual only: bigger models, big files, the whole-tree dataset over WebDAV, durable ack.
+  long:
+    if: github.event_name == 'workflow_dispatch' && inputs.long
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - name: rclone fork (v1.75.2 + ci/rclone-patches)
+        run: bash ci/setup-rclone.sh
+      - name: staged ack
+        env:
+          CFS_LONG: "1"
+          CFS_MODEL_OPS: "30000"
+        run: |
+          set -o pipefail
+          go test -count=1 -timeout 60m -p 1 ./core ./frontend/rclone ./test 2>&1 | tee "$RUNNER_TEMP/long.log"
+      - name: durable ack
+        env:
+          CFS_LONG: "1"
+          CFS_MODEL_OPS: "30000"
+          CFS_TEST_ACK: durable
+        run: |
+          set -o pipefail
+          go test -count=1 -timeout 60m ./core 2>&1 | tee "$RUNNER_TEMP/long-durable.log"
+      - name: tail of the logs
+        if: failure()
+        run: |
+          for f in long long-durable; do
+            [ -f "$RUNNER_TEMP/$f.log" ] && tail -c 100000 "$RUNNER_TEMP/$f.log" > "$RUNNER_TEMP/$f-tail.log"
+          done
+          true
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: long-logs
+          path: ${{ runner.temp }}/*-tail.log
+          retention-days: 7
+          if-no-files-found: ignore

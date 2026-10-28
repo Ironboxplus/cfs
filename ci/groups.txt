@@ -1,0 +1,16 @@
+# The test jobs. Columns: package(s, comma separated), job name, also on windows (1/0), go test -run regex.
+# Every test must match a line of its package (ci/check-groups.sh fails otherwise).
+# core is split by what the tests do, so the slow kill/crash tests run beside the rest.
+./core            core-crash   1  ^(TestCrashPoints|TestRandomKills)$
+./core            core-model   1  ^TestModel$
+./core            core-staged  1  ^(TestStaged.*|TestPackEfficiency)$
+./core            core-lease   1  ^(TestLease.*|TestSilentWriter.*|TestSecondWriter.*|TestTakeover.*|TestFenced.*|TestEpoch.*)$
+./core            core-fault   1  ^(TestFault.*|TestCancelledPut.*|TestSegmentFailure.*|TestOverwrite.*)$
+./core            core-big     1  ^(TestBigFile.*|TestThresholdEdges)$
+./core            core-rest    1  ^(TestLazyDirs.*|TestBasic.*|TestMetadataOps|TestSurvives.*|TestTransfers.*|TestListAfter.*|TestExternal.*|TestCorruption.*|TestRemoveAll|TestRebuildFromPacksAlone)$
+./frontend/rclone fe-fstests   0  ^TestFstests.*$
+./frontend/rclone fe-vfs       0  ^(TestVFS.*|TestSharedVolume.*)$
+# the OpenList tests skip themselves unless CFS_OP_BIN is set
+./test            bb-serve     0  ^(TestEdge.*|TestBigFile.*|TestServer.*|TestOpenList.*)$
+./test            bb-dataset   0  ^TestDataset.*$
+./aspect,./internal/testutil  small  0  .

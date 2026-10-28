@@ -1,0 +1,81 @@
+From c6c227a3f4d37dc9f80fedec5280ccb2ecd4f875 Mon Sep 17 00:00:00 2001
+From: cfs <cfs@local>
+Date: Wed, 28 Oct 2026 12:58:22 +0800
+Subject: [PATCH 4/4] vfs: moving a directory must not drop the destination's
+ entry of the old name
+
+Dir.rename deleted the old leaf name from the NEW parent after switching
+parents, removing an unrelated sibling (d2/s1 when d1/s1 moved to d2/s4)
+from the destination's in-memory tree. The caller already removes the entry
+from the old parent.
+---
+ vfs/dir.go      |  8 +++++++-
+ vfs/dir_test.go | 32 ++++++++++++++++++++++++++++++++
+ 2 files changed, 39 insertions(+), 1 deletion(-)
+
+diff --git a/vfs/dir.go b/vfs/dir.go
+index 9e1c437a3..8ee773513 100644
+--- a/vfs/dir.go
++++ b/vfs/dir.go
+@@ -398,11 +398,17 @@ func (d *Dir) rename(newParent *Dir, fsDir fs.Directory) {
+ 	d.modTimeMu.Unlock()
+ 	d.mu.Lock()
+ 	oldPath := d.path
++	oldParent := d.parent
+ 	d.parent = newParent
+ 	d.entry = fsDir
+ 	d.path = fsDir.Remote()
+ 	newPath := d.path
+-	delete(d.parent.items, name(oldPath))
++	if oldParent == newParent {
++		// A move into another directory is removed from the old parent by the
++		// caller. Deleting the old name from the new parent here would drop an
++		// unrelated entry of that name from the destination directory.
++		delete(d.parent.items, name(oldPath))
++	}
+ 	d.parent.items[name(d.path)] = d
+ 	d.read = time.Time{}
+ 	d.mu.Unlock()
+diff --git a/vfs/dir_test.go b/vfs/dir_test.go
+index 6a869f655..0315885f6 100644
+--- a/vfs/dir_test.go
++++ b/vfs/dir_test.go
+@@ -857,3 +857,35 @@ func TestDirMetadataExtension(t *testing.T) {
+ 		require.NoError(t, err)
+ 	}
+ }
++
++// Moving a directory into another directory must not drop the entry of the
++// destination which has the same name as the moved directory used to have.
++func TestDirRenameKeepsDestinationSiblings(t *testing.T) {
++	r, vfs := newTestVFS(t)
++	features := r.Fremote.Features()
++	if features.DirMove == nil && features.Move == nil && features.Copy == nil {
++		t.Skip("can't rename directories")
++	}
++	ctx := context.Background()
++	a := r.WriteObject(ctx, "d1/s1/a", "a", t1)
++	b := r.WriteObject(ctx, "d2/s1/b", "bb", t1)
++	r.CheckRemoteItems(t, a, b)
++
++	root, err := vfs.Root()
++	require.NoError(t, err)
++	for _, p := range []string{"d1", "d2", "d1/s1", "d2/s1"} {
++		_, err := vfs.Stat(p)
++		require.NoError(t, err)
++	}
++	d1, err := vfs.Stat("d1")
++	require.NoError(t, err)
++	d2, err := vfs.Stat("d2")
++	require.NoError(t, err)
++	_ = root
++
++	require.NoError(t, d1.(*Dir).Rename("s1", "s4", d2.(*Dir)))
++	checkListing(t, d2.(*Dir), []string{"s1,0,true", "s4,0,true"})
++	checkListing(t, d1.(*Dir), nil)
++	a.Path = "d2/s4/a"
++	fstest.CheckListingWithPrecision(t, r.Fremote, []fstest.Item{a, b}, nil, r.Fremote.Precision())
++}
+-- 
+2.45.1.windows.1
+

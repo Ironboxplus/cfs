@@ -1,0 +1,198 @@
+From 3678a41f85dcc9bea0ff3efdd9ca845d97ffb089 Mon Sep 17 00:00:00 2001
+From: vastator3 <jm@mgbsu.org>
+Date: Mon, 6 Jul 2026 19:08:33 +0800
+Subject: [PATCH 2/4] lib/file: add Rename using Windows POSIX semantics to
+ rename over open handles
+
+On Windows os.Rename cannot rename or replace a file that another handle
+still has open, even when it was opened with FILE_SHARE_DELETE. In the VFS
+cache this happens when a cache file is renamed while an in-flight
+write-back upload still holds it open: os.Rename fails, and (before the
+previous commit) that error was silently swallowed, losing the data of an
+atomic temp-file-then-rename save made over a mount.
+
+Add file.Rename which on Windows uses SetFileInformationByHandle with
+FileRenameInfoEx and FILE_RENAME_POSIX_SEMANTICS |
+FILE_RENAME_REPLACE_IF_EXISTS, so the rename succeeds over open handles,
+matching os.Rename on Unix. It falls back to os.Rename if POSIX rename is
+unsupported (pre Windows 10 1607 or a non-NTFS filesystem). On other
+platforms Rename is os.Rename.
+
+Use it for the cache rename in vfs/vfscache so mount renames no longer fail
+on Windows when the cache file is still open.
+---
+ lib/file/file_other.go   |  8 +++++
+ lib/file/file_test.go    | 32 +++++++++++++++++
+ lib/file/file_windows.go | 75 ++++++++++++++++++++++++++++++++++++++++
+ vfs/vfscache/cache.go    |  2 +-
+ 4 files changed, 116 insertions(+), 1 deletion(-)
+
+diff --git a/lib/file/file_other.go b/lib/file/file_other.go
+index d97a4250b..d88a3dce8 100644
+--- a/lib/file/file_other.go
++++ b/lib/file/file_other.go
+@@ -18,3 +18,11 @@ var OpenFile = os.OpenFile
+ func IsReserved(path string) error {
+ 	return nil
+ }
++
++// Rename renames (moves) oldPath to newPath, replacing newPath if it exists.
++//
++// On non-Windows platforms this is os.Rename, which already replaces the
++// destination and works when other handles have the file open.
++func Rename(oldPath, newPath string) error {
++	return os.Rename(oldPath, newPath)
++}
+diff --git a/lib/file/file_test.go b/lib/file/file_test.go
+index eab7bf7c1..24a9e04bb 100644
+--- a/lib/file/file_test.go
++++ b/lib/file/file_test.go
+@@ -5,6 +5,7 @@ import (
+ 	"io"
+ 	"os"
+ 	"path"
++	"path/filepath"
+ 	"runtime"
+ 	"testing"
+ 
+@@ -168,3 +169,34 @@ func TestIsReserved(t *testing.T) {
+ 	require.Error(t, IsReserved("test."))
+ 	require.Error(t, IsReserved("test "))
+ }
++
++// Test Rename, including renaming over a destination that still has an open
++// handle - the case that plain os.Rename fails on Windows.
++func TestRename(t *testing.T) {
++	dir := t.TempDir()
++
++	src := filepath.Join(dir, "src")
++	dst := filepath.Join(dir, "dst")
++
++	// Rename when the destination does not exist
++	require.NoError(t, os.WriteFile(src, []byte("one"), 0666))
++	require.NoError(t, Rename(src, dst))
++	_, err := os.Stat(src)
++	assert.True(t, os.IsNotExist(err))
++	buf, err := os.ReadFile(dst)
++	require.NoError(t, err)
++	assert.Equal(t, "one", string(buf))
++
++	// Rename over an existing destination that still has an open handle
++	require.NoError(t, os.WriteFile(src, []byte("two"), 0666))
++	f, err := Open(dst) // keep dst open across the rename
++	require.NoError(t, err)
++	require.NoError(t, Rename(src, dst))
++	assert.NoError(t, f.Close())
++
++	_, err = os.Stat(src)
++	assert.True(t, os.IsNotExist(err))
++	buf, err = os.ReadFile(dst)
++	require.NoError(t, err)
++	assert.Equal(t, "two", string(buf))
++}
+diff --git a/lib/file/file_windows.go b/lib/file/file_windows.go
+index cefd4f2f6..d5f09d8a1 100644
+--- a/lib/file/file_windows.go
++++ b/lib/file/file_windows.go
+@@ -8,6 +8,9 @@ import (
+ 	"path/filepath"
+ 	"regexp"
+ 	"syscall"
++	"unsafe"
++
++	"golang.org/x/sys/windows"
+ )
+ 
+ // OpenFile is the generalized open call; most users will use Open or Create
+@@ -100,3 +103,75 @@ func IsReserved(path string) error {
+ 	}
+ 	return nil
+ }
++
++// fileRenameInfo mirrors the Windows FILE_RENAME_INFO structure as used with
++// the FileRenameInfoEx information class. Its first field holds the rename
++// flags (a union with the BOOLEAN ReplaceIfExists used by the older
++// FileRenameInfo class).
++type fileRenameInfo struct {
++	Flags          uint32
++	RootDirectory  windows.Handle
++	FileNameLength uint32
++	FileName       [1]uint16
++}
++
++// Rename renames (moves) oldPath to newPath, replacing newPath if it exists.
++//
++// Unlike os.Rename, on Windows this uses POSIX rename semantics
++// (SetFileInformationByHandle with FileRenameInfoEx and
++// FILE_RENAME_POSIX_SEMANTICS) so the rename succeeds even when another handle
++// has the source or destination open, provided those handles were opened with
++// FILE_SHARE_DELETE (as OpenFile above does). This matches the behaviour of
++// os.Rename on Unix.
++//
++// If the POSIX rename is not supported (e.g. an older Windows release or a
++// non-NTFS filesystem) it falls back to os.Rename.
++func Rename(oldPath, newPath string) error {
++	linkErr := func(err error) error {
++		return &os.LinkError{Op: "rename", Old: oldPath, New: newPath, Err: err}
++	}
++
++	namep, err := windows.UTF16PtrFromString(UNCPath(oldPath))
++	if err != nil {
++		return linkErr(err)
++	}
++
++	// Open the source with DELETE access and full sharing so the rename can
++	// proceed even while other handles are open.
++	handle, err := windows.CreateFile(
++		namep,
++		windows.DELETE,
++		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE,
++		nil,
++		windows.OPEN_EXISTING,
++		windows.FILE_FLAG_BACKUP_SEMANTICS,
++		0,
++	)
++	if err != nil {
++		return linkErr(err)
++	}
++
++	targetp, err := windows.UTF16FromString(UNCPath(newPath))
++	if err != nil {
++		_ = windows.CloseHandle(handle)
++		return linkErr(err)
++	}
++
++	// FileNameLength is in bytes and excludes the terminating NUL.
++	nameLen := (len(targetp) - 1) * 2
++	bufLen := int(unsafe.Offsetof(fileRenameInfo{}.FileName)) + nameLen
++	buf := make([]byte, bufLen)
++	info := (*fileRenameInfo)(unsafe.Pointer(&buf[0]))
++	info.Flags = windows.FILE_RENAME_REPLACE_IF_EXISTS | windows.FILE_RENAME_POSIX_SEMANTICS
++	info.FileNameLength = uint32(nameLen)
++	copy(unsafe.Slice(&info.FileName[0], len(targetp)-1), targetp[:len(targetp)-1])
++
++	err = windows.SetFileInformationByHandle(handle, windows.FileRenameInfoEx, &buf[0], uint32(bufLen))
++	_ = windows.CloseHandle(handle)
++	if err != nil {
++		// POSIX rename is unsupported here (pre Windows 10 1607 or a non-NTFS
++		// filesystem); fall back to a plain rename.
++		return os.Rename(oldPath, newPath)
++	}
++	return nil
++}
+diff --git a/vfs/vfscache/cache.go b/vfs/vfscache/cache.go
+index ca79f228b..2d387f54e 100644
+--- a/vfs/vfscache/cache.go
++++ b/vfs/vfscache/cache.go
+@@ -411,7 +411,7 @@ func rename(osOldPath, osNewPath string) error {
+ 			return nil
+ 		}
+ 	}
+-	if err = os.Rename(osOldPath, osNewPath); err != nil {
++	if err = file.Rename(osOldPath, osNewPath); err != nil {
+ 		return fmt.Errorf("failed to rename in cache: %s to %s: %w", osOldPath, osNewPath, err)
+ 	}
+ 	return nil
+-- 
+2.45.1.windows.1
+

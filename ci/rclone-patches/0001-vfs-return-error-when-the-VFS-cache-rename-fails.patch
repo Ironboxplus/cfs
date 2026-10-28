@@ -1,0 +1,36 @@
+From 014ddd7befa70e5a630fbf3d80740deb5ddfb1bd Mon Sep 17 00:00:00 2001
+From: vastator3 <jm@mgbsu.org>
+Date: Mon, 6 Jul 2026 18:56:18 +0800
+Subject: [PATCH 1/4] vfs: return error when the VFS cache rename fails
+
+Previously File.Rename logged a failed cache rename at Info level and then
+carried on returning success. On Windows os.Rename fails if another handle
+has the destination open (for example an in-flight write-back upload), so
+the rename reported success to the OS while the cache file was left at the
+old name - silently losing the just-written data of an atomic
+temp-file-then-rename save.
+
+Return the error from cache.Rename instead so the failure is visible and
+propagated to the caller. The underlying Windows rename is fixed
+separately.
+---
+ vfs/file.go | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/vfs/file.go b/vfs/file.go
+index 11d63d803..24d87b8e5 100644
+--- a/vfs/file.go
++++ b/vfs/file.go
+@@ -275,7 +275,8 @@ func (f *File) rename(ctx context.Context, destDir *Dir, newName string) error {
+ 		// Rename in the cache
+ 		if d.vfs.cache != nil && d.vfs.cache.Exists(oldPath) {
+ 			if err := d.vfs.cache.Rename(oldPath, newPath, newObject); err != nil {
+-				fs.Infof(f.Path(), "File.Rename failed in Cache: %v", err)
++				fs.Errorf(f.Path(), "File.Rename failed in Cache: %v", err)
++				return err
+ 			}
+ 		}
+ 		// Update the node with the new details
+-- 
+2.45.1.windows.1
+

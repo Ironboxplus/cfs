@@ -1,0 +1,125 @@
+From b69e0df9ab102bec1843903a72f19925123743bb Mon Sep 17 00:00:00 2001
+From: Kurptas <299624347+Kurptas@users.noreply.github.com>
+Date: Fri, 25 Sep 2026 22:01:46 +0800
+Subject: [PATCH 3/4] vfs: fail instead of silently losing data when a cache
+ rename fails
+
+On Windows os.Rename (MoveFileEx) cannot replace a destination that is open,
+even when the open handle shares delete, and with --vfs-cache-mode full the
+target of an atomic temp-file rename keeps its cache file open (its Item holds
+the fd for the handle cache grace period).  The cache rename then failed with
+Access is denied.
+
+File.Rename only logged that at Info level and returned success, so the
+application saw the save succeed while the cache kept both files: the
+destination's stale data stayed at the destination name and the newly written
+data stayed at the temporary name.  The re-targeted write back then uploaded
+the destination's stale (or empty) data over the remote, silently losing the
+user's new content (truncated or reverted file).  See
+https://github.com/rclone/rclone/issues/9943.
+
+Fail the rename instead:
+
+  * vfs/file.go: propagate the cache rename error to the caller and to the
+    application, and put the file's directory/leaf back so the node stays
+    consistent with the unchanged directory entry.
+  * vfs/vfscache/item.go: perform the cache file renames before mutating any
+    item state so that a failure leaves the item's name, its cache files and
+    its pending write back target untouched (the pending data is then uploaded
+    under its own name rather than overwriting the destination).
+
+The real fix for atomic saves over an open cache file is a Windows POSIX
+semantics rename (see PR #9574); this change makes the failure safe in the
+meantime.
+---
+ vfs/file.go          | 16 +++++++++++++++-
+ vfs/vfscache/item.go | 25 +++++++++++++++++++------
+ 2 files changed, 34 insertions(+), 7 deletions(-)
+
+diff --git a/vfs/file.go b/vfs/file.go
+index 24d87b8e5..ee7a15fbc 100644
+--- a/vfs/file.go
++++ b/vfs/file.go
+@@ -275,6 +275,10 @@ func (f *File) rename(ctx context.Context, destDir *Dir, newName string) error {
+ 		// Rename in the cache
+ 		if d.vfs.cache != nil && d.vfs.cache.Exists(oldPath) {
+ 			if err := d.vfs.cache.Rename(oldPath, newPath, newObject); err != nil {
++				// Don't carry on: the cache files still have their old names, so
++				// the pending write back would upload the destination's stale
++				// (or empty) data in place of the data the user just saved.
++				// Fail the rename so the caller (and the application) sees it.
+ 				fs.Errorf(f.Path(), "File.Rename failed in Cache: %v", err)
+ 				return err
+ 			}
+@@ -295,6 +299,7 @@ func (f *File) rename(ctx context.Context, destDir *Dir, newName string) error {
+ 	// rename the file object
+ 	dPath := destDir.Path()
+ 	f.mu.Lock()
++	oldD, oldDPath, oldLeaf := f.d, f.dPath, f.leaf
+ 	f.d = destDir
+ 	f.dPath = dPath
+ 	f.leaf = newName
+@@ -314,7 +319,16 @@ func (f *File) rename(ctx context.Context, destDir *Dir, newName string) error {
+ 		return nil
+ 	}
+ 
+-	return renameCall(ctx)
++	if err := renameCall(ctx); err != nil {
++		// The rename failed so put the file back where it was: the directory
++		// entry is unchanged (Dir.Rename returns the error before moving the
++		// node between directories) and the node must agree with it.
++		f.mu.Lock()
++		f.d, f.dPath, f.leaf = oldD, oldDPath, oldLeaf
++		f.mu.Unlock()
++		return err
++	}
++	return nil
+ }
+ 
+ // addWriter adds a write handle to the file
+diff --git a/vfs/vfscache/item.go b/vfs/vfscache/item.go
+index f25f90734..4583a752f 100644
+--- a/vfs/vfscache/item.go
++++ b/vfs/vfscache/item.go
+@@ -1553,12 +1553,12 @@ func (item *Item) rename(name string, newName string, newObj fs.Object) (err err
+ 	// id for writeback cancel
+ 	id := item.writeBackID
+ 
+-	// Set internal state
+-	item.name = newName
+-	item.o = newObj
+-	item._updateFingerprint()
+-
+-	// Rename cache file if it exists
++	// Rename cache file if it exists.
++	//
++	// Do this before changing any state: on Windows os.Rename can fail with
++	// Access is denied when the destination cache file is open (it is held open
++	// by the target's Item while it is cached) and the item, its files and its
++	// pending write back must all stay untouched in that case.
+ 	err = rename(item.c.toOSPath(name), item.c.toOSPath(newName)) // No locking in Cache
+ 
+ 	// Rename meta file if it exists
+@@ -1567,6 +1567,19 @@ func (item *Item) rename(name string, newName string, newObj fs.Object) (err err
+ 		err = err2
+ 	}
+ 
++	if err != nil {
++		item.mu.Unlock()
++		if downloaders != nil {
++			_ = downloaders.Close(nil)
++		}
++		return err
++	}
++
++	// Set internal state
++	item.name = newName
++	item.o = newObj
++	item._updateFingerprint()
++
+ 	item.mu.Unlock()
+ 
+ 	// close downloader and cancel writebacks with mutex unlocked
+-- 
+2.45.1.windows.1
+
