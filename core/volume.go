@@ -325,7 +325,6 @@ func (v *Volume) readLease(ctx context.Context) (lease, bool, error) {
 		err = json.NewDecoder(rc).Decode(&l)
 		rc.Close()
 		if err == nil {
-			v.leaseAt.Store(time.Now().UnixNano())
 			return l, true, nil
 		}
 		lastErr = err
@@ -428,11 +427,14 @@ func (v *Volume) releaseLease(ctx context.Context) error {
 // checkLease re-reads the lease and fences this writer if a newer epoch or a
 // different writer holds it. Called before every commit.
 //
-// A read less than LeaseTTL/6 after the last successful read or write of the
-// lease is skipped. Another writer can only take over after our heartbeat has
+// A fenced writer always fails. Otherwise a read less than LeaseTTL/6 after the
+// last write of the lease, or the last read that found it still ours, is skipped. Another writer can only take over after our heartbeat has
 // failed for longer than LeaseTTL, so by then the last success is older than
 // LeaseTTL/6 and the check before the next commit reads for real and fences.
 func (v *Volume) checkLease(ctx context.Context) error {
+	if v.fenced.Load() {
+		return ErrFenced
+	}
 	if at := v.leaseAt.Load(); at != 0 && time.Since(time.Unix(0, at)) < v.cfg.LeaseTTL/6 {
 		return nil
 	}
@@ -447,6 +449,9 @@ func (v *Volume) readCheckLease(ctx context.Context) error {
 	if ok && (l.Epoch > v.epoch || (l.Epoch == v.epoch && l.Writer != v.writerID)) {
 		v.fenced.Store(true)
 		return ErrFenced
+	}
+	if ok {
+		v.leaseAt.Store(time.Now().UnixNano())
 	}
 	return nil
 }
