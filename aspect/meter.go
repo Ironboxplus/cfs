@@ -23,6 +23,7 @@ type Stats struct {
 	// since the meter was created or reset.
 	PeakMeta     int
 	PeakTransfer int
+	PeakRead     int
 }
 
 func (s Stats) String() string {
@@ -35,8 +36,8 @@ func (s Stats) String() string {
 	for _, k := range keys {
 		fmt.Fprintf(&b, "%s=%d ", k, s.Calls[k])
 	}
-	return fmt.Sprintf("calls=%d [%s] read=%dB written=%dB peak_inflight meta=%d transfer=%d",
-		s.Total, strings.TrimSpace(b.String()), s.BytesRead, s.BytesWritten, s.PeakMeta, s.PeakTransfer)
+	return fmt.Sprintf("calls=%d [%s] read=%dB written=%dB peak_inflight meta=%d transfer=%d read=%d",
+		s.Total, strings.TrimSpace(b.String()), s.BytesRead, s.BytesWritten, s.PeakMeta, s.PeakTransfer, s.PeakRead)
 }
 
 // Meter counts the calls, bytes and peak concurrency per class reaching the
@@ -46,8 +47,8 @@ type Meter struct {
 	store.Store
 	mu    sync.Mutex
 	calls map[string]int64
-	cur   [2]int
-	peak  [2]int
+	cur   [3]int
+	peak  [3]int
 	rd    atomic.Int64
 	wr    atomic.Int64
 }
@@ -73,7 +74,7 @@ func (m *Meter) leave(c Class) {
 func (m *Meter) Snapshot() Stats {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	s := Stats{Calls: map[string]int64{}, PeakMeta: m.peak[Meta], PeakTransfer: m.peak[Transfer],
+	s := Stats{Calls: map[string]int64{}, PeakMeta: m.peak[Meta], PeakTransfer: m.peak[Transfer], PeakRead: m.peak[Read],
 		BytesRead: m.rd.Load(), BytesWritten: m.wr.Load()}
 	for k, v := range m.calls {
 		s.Calls[k] = v
@@ -196,11 +197,11 @@ func (m *Meter) Put(ctx context.Context, p string, src store.Source, o store.Put
 }
 
 func (m *Meter) Open(ctx context.Context, p string, off, n int64) (io.ReadCloser, error) {
-	m.enter("open", Transfer)
+	m.enter("open", Read)
 	rc, err := m.Store.Open(ctx, p, off, n)
 	if err != nil {
-		m.leave(Transfer)
+		m.leave(Read)
 		return nil, err
 	}
-	return &countReader{rc: rc, n: &m.rd, done: func() { m.leave(Transfer) }}, nil
+	return &countReader{rc: rc, n: &m.rd, done: func() { m.leave(Read) }}, nil
 }

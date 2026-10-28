@@ -74,8 +74,12 @@ type Config struct {
 	// that touches a staged name seal at once, and so does a full staging area).
 	SealQuiet time.Duration
 	SealMax   time.Duration
-	// ReadChunk is the size of one ranged read of a large file. Default 8 MiB.
-	ReadChunk int64
+	// ReadBuffer bounds the memory the reads of packed and staged files hold at
+	// once (compressed plus decoded bytes, from the start of a read until its
+	// reader is closed); a read that would go over waits. Default 300 MiB, the
+	// default of JuiceFS'"'"'s buffer-size. A member larger than the whole budget takes
+	// all of it.
+	ReadBuffer int64
 	// Pipeline is how many sealed packs may be in commit at once, besides the
 	// one filling. Default 8 (the transfers setting).
 	Pipeline int
@@ -147,8 +151,8 @@ func (c *Config) fill() error {
 			c.SealMax = 10 * time.Minute
 		}
 	}
-	if c.ReadChunk <= 0 {
-		c.ReadChunk = 8 << 20
+	if c.ReadBuffer <= 0 {
+		c.ReadBuffer = 300 << 20
 	}
 	if c.Pipeline <= 0 {
 		c.Pipeline = 8

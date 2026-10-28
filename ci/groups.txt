@@ -7,6 +7,7 @@
 ./core            core-lease   1  ^(TestLease.*|TestSilentWriter.*|TestSecondWriter.*|TestTakeover.*|TestFenced.*|TestEpoch.*)$
 ./core            core-fault   1  ^(TestFault.*|TestCancelledPut.*|TestSegmentFailure.*|TestOverwrite.*)$
 ./core            core-big     1  ^(TestBigFile.*|TestThresholdEdges)$
+./core            core-read    1  ^TestRead.*$
 ./core            core-rest    1  ^(TestLazyDirs.*|TestBasic.*|TestMetadataOps|TestSurvives.*|TestTransfers.*|TestListAfter.*|TestExternal.*|TestCorruption.*|TestRemoveAll|TestRebuildFromPacksAlone)$
 ./frontend/rclone fe-fstests   0  ^TestFstests.*$
 ./frontend/rclone fe-vfs       0  ^(TestVFS.*|TestSharedVolume.*)$

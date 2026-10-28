@@ -75,13 +75,12 @@ func hashStream(r io.Reader) (string, int64, error) {
 	return hex.EncodeToString(h.Sum(nil)), n, err
 }
 
-// bigVolume opens a volume on st with a 64 KiB threshold and 256 KiB read
-// chunks: a few MiB exercise what 8 MiB / GiB files would (rclone's chunked-upload
-// tests shrink their chunk sizes the same way).
+// bigVolume opens a volume on st with a 64 KiB threshold: a few MiB exercise what
+// 8 MiB / GiB files would.
 func bigVolume(t *testing.T, st store.Store, transfers int) (*core.Volume, *aspect.Meter) {
 	s, m := testutil.Stacked(st, aspect.Options{Gate: aspect.GateOpts{MetaInflight: 1, Transfers: transfers}})
 	cfg := testutil.FastConfig(t.TempDir())
-	cfg.Threshold, cfg.ReadChunk = 64<<10, 256<<10
+	cfg.Threshold = 64 << 10
 	v, err := core.Open(context.Background(), s, cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -125,7 +124,7 @@ func testBigFile(t *testing.T, size int64, mkStore func(t *testing.T, drive stri
 	down := time.Since(t0)
 	// Random ranges, including ones that straddle chunk boundaries.
 	rng := rand.New(rand.NewPCG(1, 2))
-	chunk := v.Config().ReadChunk
+	chunk := int64(256 << 10) // offsets around multiples of this
 	offs := []int64{0, chunk - 7, chunk, 2*chunk + 11, size - 100, size - chunk - 5}
 	for i := 0; i < 12; i++ {
 		offs = append(offs, rng.Int64N(size-1))
@@ -154,9 +153,9 @@ func testBigFile(t *testing.T, size int64, mkStore func(t *testing.T, drive stri
 	if s.PeakMeta > 1 || s.PeakTransfer > 8 {
 		t.Errorf("in-flight peaks exceed limits: %s", s)
 	}
-	// Sequential ranged reads of ReadChunk: the number of opens is what the chunk size says.
-	if min := (size + chunk - 1) / chunk; s.Calls["open"] < min {
-		t.Errorf("a %d byte file read in %d byte chunks needs at least %d range requests, saw %d", size, chunk, min, s.Calls["open"])
+	// One ranged request per read, whatever its length: the full read plus the ranges.
+	if want := int64(1 + len(offs)); s.Calls["open"] != want {
+		t.Errorf("%d reads made %d range requests", want, s.Calls["open"])
 	}
 }
 

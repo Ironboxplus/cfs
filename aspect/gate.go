@@ -19,12 +19,16 @@ type Class int
 
 const (
 	Meta     Class = iota // List/Stat/Remove/Move/DirMove/Mkdir/Rmdir/SetModTime/Hash
-	Transfer              // Put and ranged Open
+	Transfer              // Put
+	Read                  // ranged Open: the body holds the slot until EOF or Close
 )
 
 func (c Class) String() string {
-	if c == Meta {
+	switch c {
+	case Meta:
 		return "meta"
+	case Read:
+		return "read"
 	}
 	return "transfer"
 }
@@ -33,7 +37,12 @@ func (c Class) String() string {
 // the layer below (OpenList limit_rate); the gate only bounds concurrency.
 type GateOpts struct {
 	MetaInflight int // default 1
-	Transfers    int // default 8
+	Transfers    int // uploads, default 8
+	// ReadTransfers bounds the open response bodies of ranged reads; default: the
+	// value of Transfers. A body holds its slot until it is read to the end or
+	// closed, so a slow reader would starve uploads if reads and uploads shared
+	// one limit (JuiceFS keeps max-uploads and max-downloads apart for this reason).
+	ReadTransfers int
 }
 
 func (o *GateOpts) fill() {
@@ -43,21 +52,24 @@ func (o *GateOpts) fill() {
 	if o.Transfers <= 0 {
 		o.Transfers = 8
 	}
+	if o.ReadTransfers <= 0 {
+		o.ReadTransfers = o.Transfers
+	}
 }
 
 type gate struct {
 	store.Store
-	sem [2]chan struct{}
+	sem [3]chan struct{}
 }
 
 // Gate limits the calls reaching s: at most MetaInflight metadata calls and at
-// most Transfers data transfers at a time. A transfer holds its slot from the
-// start of Put or Open until the Put returns or the reader is closed (or hits
-// EOF), so callers must read ranges in bounded chunks and close promptly.
+// most Transfers uploads and ReadTransfers open read bodies at a time. An upload
+// holds its slot until the Put returns; a read body holds its slot from Open until
+// the reader is closed (or hits EOF), so readers must close promptly.
 func Gate(s store.Store, o GateOpts) store.Store {
 	o.fill()
-	return &gate{Store: s, sem: [2]chan struct{}{
-		make(chan struct{}, o.MetaInflight), make(chan struct{}, o.Transfers),
+	return &gate{Store: s, sem: [3]chan struct{}{
+		make(chan struct{}, o.MetaInflight), make(chan struct{}, o.Transfers), make(chan struct{}, o.ReadTransfers),
 	}}
 }
 
@@ -161,18 +173,18 @@ func (g *gate) Put(ctx context.Context, p string, src store.Source, o store.PutO
 }
 
 func (g *gate) Open(ctx context.Context, p string, off, n int64) (io.ReadCloser, error) {
-	if err := g.acquire(ctx, Transfer); err != nil {
+	if err := g.acquire(ctx, Read); err != nil {
 		return nil, err
 	}
 	rc, err := g.Store.Open(ctx, p, off, n)
 	if err != nil {
-		g.release(Transfer)
+		g.release(Read)
 		return nil, err
 	}
-	return &slotReader{rc: rc, release: func() { g.release(Transfer) }}, nil
+	return &slotReader{rc: rc, release: func() { g.release(Read) }}, nil
 }
 
-// slotReader returns its transfer slot at EOF or Close, whichever comes first.
+// slotReader returns its read slot at EOF or Close, whichever comes first.
 type slotReader struct {
 	rc      io.ReadCloser
 	release func()

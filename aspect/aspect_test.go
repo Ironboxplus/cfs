@@ -22,7 +22,7 @@ func TestGateBoundsEachClassSeparately(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
 	m := aspect.NewMeter(testutil.LocalStore(t, dir))
-	g := aspect.Gate(m, aspect.GateOpts{MetaInflight: 1, Transfers: 3})
+	g := aspect.Gate(m, aspect.GateOpts{MetaInflight: 1, Transfers: 3, ReadTransfers: 3})
 	for i := 0; i < 30; i++ {
 		if err := g.Put(ctx, fmt.Sprintf("f%d", i), store.Bytes(make([]byte, 1<<16)), store.PutOpts{Size: 1 << 16}); err != nil {
 			t.Fatal(err)
@@ -61,8 +61,11 @@ func TestGateBoundsEachClassSeparately(t *testing.T) {
 	if s.PeakMeta != 1 {
 		t.Errorf("metadata peak %d, want 1", s.PeakMeta)
 	}
-	if s.PeakTransfer < 2 || s.PeakTransfer > 3 {
-		t.Errorf("transfer peak %d, want 2..3", s.PeakTransfer)
+	if s.PeakRead < 2 || s.PeakRead > 3 {
+		t.Errorf("read peak %d, want 2..3", s.PeakRead)
+	}
+	if s.PeakTransfer > 3 {
+		t.Errorf("transfer peak %d, want at most 3", s.PeakTransfer)
 	}
 }
 
@@ -70,7 +73,7 @@ func TestGateSlotIsReleasedAtEOFAndClose(t *testing.T) {
 	ctx := context.Background()
 	st := testutil.LocalStore(t, t.TempDir())
 	st.Put(ctx, "a", store.Bytes([]byte("hello")), store.PutOpts{Size: 5})
-	g := aspect.Gate(st, aspect.GateOpts{Transfers: 1})
+	g := aspect.Gate(st, aspect.GateOpts{ReadTransfers: 1})
 	// Reading to EOF frees the slot even if the caller forgets Close.
 	rc, err := g.Open(ctx, "a", 0, -1)
 	if err != nil {
@@ -102,8 +105,8 @@ func TestGateMetadataIsNotBlockedByTransfers(t *testing.T) {
 	ctx := context.Background()
 	st := testutil.LocalStore(t, t.TempDir())
 	st.Put(ctx, "a", store.Bytes([]byte("hello")), store.PutOpts{Size: 5})
-	g := aspect.Gate(st, aspect.GateOpts{MetaInflight: 1, Transfers: 1})
-	rc, err := g.Open(ctx, "a", 0, 1) // holds the only transfer slot
+	g := aspect.Gate(st, aspect.GateOpts{MetaInflight: 1, ReadTransfers: 1})
+	rc, err := g.Open(ctx, "a", 0, 1) // holds the only read slot
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -112,6 +115,31 @@ func TestGateMetadataIsNotBlockedByTransfers(t *testing.T) {
 	defer cancel()
 	if _, err := g.List(ctx2, ""); err != nil {
 		t.Fatalf("a listing must not wait for a running transfer: %v", err)
+	}
+}
+
+// A reader that stops reading keeps its read slot, and uploads still go on: the
+// two classes are counted apart.
+func TestGateStalledReaderDoesNotBlockUploads(t *testing.T) {
+	ctx := context.Background()
+	st := testutil.LocalStore(t, t.TempDir())
+	st.Put(ctx, "a", store.Bytes(make([]byte, 1<<16)), store.PutOpts{Size: 1 << 16})
+	g := aspect.Gate(st, aspect.GateOpts{Transfers: 1, ReadTransfers: 1})
+	rc, err := g.Open(ctx, "a", 0, -1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rc.Close()
+	rc.Read(make([]byte, 10)) // started, then stalled
+	ctx2, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	if err := g.Put(ctx2, "b", store.Bytes([]byte("x")), store.PutOpts{Size: 1}); err != nil {
+		t.Fatalf("an upload waited for a stalled reader: %v", err)
+	}
+	ctx3, cancel3 := context.WithTimeout(ctx, 100*time.Millisecond)
+	defer cancel3()
+	if _, err := g.Open(ctx3, "a", 0, 1); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("a second reader should wait for the read slot, got %v", err)
 	}
 }
 

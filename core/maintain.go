@@ -1,6 +1,7 @@
 package core
 
 import (
+	"bufio"
 	"bytes"
 	"compress/flate"
 	"context"
@@ -12,7 +13,6 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"time"
 
 	"github.com/Ironboxplus/cfs/store"
@@ -536,57 +536,97 @@ func (v *Volume) compareWithDrive(ctx context.Context) ([]mismatch, error) {
 	return out, nil
 }
 
-// deepCheckPack reads a pack once, front to back, and verifies the pack's
-// SHA-1 and every live member in it.
+// maxStreamBufferSize is the read-ahead buffer of the pack check, restic's
+// value (internal/repository/checker.go).
+const maxStreamBufferSize = 4 << 20
+
+// deepCheckPack checks a pack the way restic's checkPackInner does
+// (internal/repository/checker.go): the pack is read once, front to back, as one
+// stream; its hash is computed on the fly; a 4 MiB bufio.Reader sits on it; the
+// members are read one by one, in order of offset, into a buffer that is as big
+// as the largest member, and verified; the gaps between them are skipped with
+// Discard; the rest of the stream is read, and the hash of the whole pack is
+// compared with the index. So memory use is the read-ahead buffer plus one
+// member, whatever the size of the pack. A check that finds anything is run once
+// more from the start (restic's checkPack): only what the second run finds is
+// reported, which tells a transient error from damage.
 func (v *Volume) deepCheckPack(ctx context.Context, name, wantSHA string, rows []fileRow, add func(kind, p, format string, args ...any)) {
-	var total int64
-	for _, r := range rows {
-		total = max(total, r.Off+r.CSize)
-	}
 	e, err := v.st.Stat(ctx, CtlDir+"/packs/"+name)
 	if err != nil {
 		add("pack_unreadable", name, "%v", err)
 		return
 	}
-	h := sha1.New()
-	buf := make([]byte, 0, e.Size)
-	for off := int64(0); off < e.Size; off += v.cfg.ReadChunk {
-		n := min(v.cfg.ReadChunk, e.Size-off)
-		rc, err := v.st.Open(ctx, CtlDir+"/packs/"+name, off, n)
+	sort.Slice(rows, func(i, j int) bool { return rows[i].Off < rows[j].Off })
+	type finding struct{ kind, path, msg string }
+	run := func() (found []finding, err error) {
+		note := func(kind, p, format string, args ...any) {
+			found = append(found, finding{kind, p, fmt.Sprintf(format, args...)})
+		}
+		var biggest int64
+		for _, r := range rows {
+			biggest = max(biggest, r.CSize)
+		}
+		rc, err := v.st.Open(ctx, CtlDir+"/packs/"+name, 0, e.Size)
 		if err != nil {
-			add("pack_unreadable", name, "%v", err)
-			return
+			return nil, err
 		}
-		chunk, err := io.ReadAll(rc)
-		rc.Close()
-		if err != nil || int64(len(chunk)) != n {
-			add("pack_unreadable", name, "short read at %d", off)
-			return
-		}
-		h.Write(chunk)
-		buf = append(buf, chunk...)
-	}
-	if got := hex.EncodeToString(h.Sum(nil)); wantSHA != "" && got != wantSHA {
-		add("pack_checksum", name, "sha1 is %s, the index says %s", got, wantSHA)
-	}
-	for _, r := range rows {
-		if r.Off+r.CSize > int64(len(buf)) {
-			continue
-		}
-		raw := buf[r.Off : r.Off+r.CSize]
-		data := raw
-		if r.Meth == 8 {
-			var derr error
-			data, derr = io.ReadAll(flate.NewReader(bytes.NewReader(raw)))
-			if derr != nil {
-				add("member_checksum", r.Path, "cannot inflate: %v", derr)
+		defer rc.Close()
+		h := sha1.New()
+		br := bufio.NewReaderSize(io.TeeReader(rc, h), maxStreamBufferSize)
+		buf := make([]byte, biggest)
+		var pos int64
+		for _, r := range rows {
+			if r.Off < pos || r.Off+r.CSize > e.Size {
+				note("member_checksum", r.Path, "stored at %d+%d, which overlaps the member before it or lies beyond the end of the pack (%d bytes)", r.Off, r.CSize, e.Size)
 				continue
 			}
+			if _, err := br.Discard(int(r.Off - pos)); err != nil {
+				return found, fmt.Errorf("skip to %d: %w", r.Off, err)
+			}
+			if _, err := io.ReadFull(br, buf[:r.CSize]); err != nil {
+				return found, fmt.Errorf("read %s at %d: %w", r.Path, r.Off, err)
+			}
+			pos = r.Off + r.CSize
+			var plain io.Reader = bytes.NewReader(buf[:r.CSize])
+			if r.Meth == 8 {
+				plain = flate.NewReader(plain)
+			}
+			ms := sha1.New()
+			n, derr := io.Copy(ms, plain)
+			switch {
+			case derr != nil:
+				note("member_checksum", r.Path, "cannot inflate: %v", derr)
+			case n != r.Size || hex.EncodeToString(ms.Sum(nil)) != r.SHA1:
+				note("member_checksum", r.Path, "content doesn't match the recorded size/sha1")
+			}
 		}
-		sum := sha1.Sum(data)
-		if int64(len(data)) != r.Size || hex.EncodeToString(sum[:]) != r.SHA1 {
-			add("member_checksum", r.Path, "content doesn't match the recorded size/sha1")
+		// The rest: what follows the last member (the manifest, the directory).
+		if _, err := br.Discard(int(e.Size - pos)); err != nil {
+			return found, fmt.Errorf("read the end of the pack: %w", err)
+		}
+		if _, err := br.ReadByte(); err != io.EOF {
+			note("pack_checksum", name, "the pack is longer than the %d bytes the drive lists", e.Size)
+		}
+		if got := hex.EncodeToString(h.Sum(nil)); wantSHA != "" && got != wantSHA {
+			note("pack_checksum", name, "sha1 is %s, the index says %s", got, wantSHA)
+		}
+		return found, nil
+	}
+	found, err := run()
+	if err != nil || len(found) > 0 {
+		first := err
+		if err == nil {
+			first = fmt.Errorf("%d problems, the first: %s: %s", len(found), found[0].path, found[0].msg)
+		}
+		found, err = run()
+		if err == nil && len(found) == 0 {
+			v.logf("cfs: check of pack %s passed on the second attempt, the first found: %v", name, first)
 		}
 	}
-	_ = strconv.Itoa
+	for _, f := range found {
+		add(f.kind, f.path, "%s", f.msg)
+	}
+	if err != nil {
+		add("pack_unreadable", name, "%v", err)
+	}
 }

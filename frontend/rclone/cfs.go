@@ -87,13 +87,18 @@ func init() {
 			Advanced: true,
 		}, {
 			Name:     "transfers",
-			Help:     "Maximum simultaneous data transfers (uploads and ranged reads) to the remote. Each large file is still transferred sequentially.",
+			Help:     "Maximum simultaneous uploads to the remote (packs, log segments, large files). Reads have their own limit, read_transfers.",
 			Default:  8,
 			Advanced: true,
 		}, {
-			Name:     "read_chunk",
-			Help:     "Size of one ranged read of a large file.",
-			Default:  fs.SizeSuffix(8 << 20),
+			Name:     "read_transfers",
+			Help:     "Maximum simultaneous read streams from the remote (ranged reads of large files and of packs). Each one holds its slot until it is read to the end or closed. 0: the value of transfers.",
+			Default:  0,
+			Advanced: true,
+		}, {
+			Name:     "read_buffer",
+			Help:     "Most memory the reads of small (packed or staged) files hold at once; a read waits while it is spent.",
+			Default:  fs.SizeSuffix(300 << 20),
 			Advanced: true,
 		}, {
 			Name:     "read_window",
@@ -142,7 +147,8 @@ type Options struct {
 	SealMax         fs.Duration   `config:"seal_max"`
 	MetaInflight    int           `config:"meta_inflight"`
 	Transfers       int           `config:"transfers"`
-	ReadChunk       fs.SizeSuffix `config:"read_chunk"`
+	ReadTransfers   int           `config:"read_transfers"`
+	ReadBuffer      fs.SizeSuffix `config:"read_buffer"`
 	ReadWindow      fs.SizeSuffix `config:"read_window"`
 	DirCache        fs.Duration   `config:"dir_cache"`
 	LeaseTTL        fs.Duration   `config:"lease_ttl"`
@@ -223,7 +229,7 @@ func openRef(ctx context.Context, key string, under func() (fs.Fs, error), opt *
 		return nil, err
 	}
 	st, meter := aspect.Stack(rclonestore.New(u), aspect.Options{
-		Gate:  aspect.GateOpts{MetaInflight: opt.MetaInflight, Transfers: opt.Transfers},
+		Gate:  aspect.GateOpts{MetaInflight: opt.MetaInflight, Transfers: opt.Transfers, ReadTransfers: opt.ReadTransfers},
 		Retry: aspect.RetryOpts{Attempts: opt.Retries},
 	})
 	v, err := core.Open(ctx, st, core.Config{
@@ -235,7 +241,7 @@ func openRef(ctx context.Context, key string, under func() (fs.Fs, error), opt *
 		StageMaxBytes:   int64(opt.StageMaxBytes),
 		SealQuiet:       time.Duration(opt.SealQuiet),
 		SealMax:         time.Duration(opt.SealMax),
-		ReadChunk:       int64(opt.ReadChunk),
+		ReadBuffer:      int64(opt.ReadBuffer),
 		ReadWindow:      int64(opt.ReadWindow),
 		Pipeline:        opt.Transfers,
 		DirCacheTTL:     time.Duration(opt.DirCache),
@@ -708,7 +714,7 @@ func (f *Fs) Command(ctx context.Context, name string, arg []string, opt map[str
 		}
 		s := f.ref.meter.Snapshot()
 		return map[string]any{"calls": s.Calls, "total": s.Total, "bytes_read": s.BytesRead, "bytes_written": s.BytesWritten,
-			"peak_meta": s.PeakMeta, "peak_transfer": s.PeakTransfer}, nil
+			"peak_meta": s.PeakMeta, "peak_transfer": s.PeakTransfer, "peak_read": s.PeakRead}, nil
 	}
 	return nil, fs.ErrorCommandNotFound
 }

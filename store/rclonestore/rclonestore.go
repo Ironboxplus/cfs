@@ -177,7 +177,10 @@ func (s *Store) Open(ctx context.Context, p string, off, n int64) (io.ReadCloser
 		}
 		opts = append(opts, &fs.RangeOption{Start: off, End: end})
 	}
-	rc, err := o.Open(ctx, opts...)
+	// operations.Open reads through ReOpen: a read that breaks off in the middle is
+	// reopened at the byte where it stopped (at most LowLevelRetries times), the way
+	// rclone copies do.
+	rc, err := operations.Open(ctx, o, opts...)
 	if err != nil {
 		s.forget(p)
 		return nil, mapErr(err)

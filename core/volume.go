@@ -25,6 +25,8 @@ import (
 
 	"github.com/Ironboxplus/cfs/metalog"
 	"github.com/Ironboxplus/cfs/store"
+	"golang.org/x/sync/semaphore"
+	"golang.org/x/sync/singleflight"
 )
 
 // Entry is a file or directory of the volume.
@@ -84,8 +86,12 @@ type Volume struct {
 
 	dc      *dirCache
 	mc      *memCache
-	wc      *memCache    // read windows of packs
-	packSz  sync.Map     // pack name -> bytes
+	wc      *memCache           // read windows of packs
+	packSz  sync.Map            // pack name -> bytes
+	sf      singleflight.Group  // one load per member (pack@off) or read window (pack#n) at a time
+	rb      *semaphore.Weighted // Config.ReadBuffer, in bytes
+	rbUsed  atomic.Int64
+	rbPeak  atomic.Int64
 	segsNew atomic.Int64 // segments committed since the last checkpoint
 	ckptRun atomic.Bool
 	ckptOne sync.Mutex // one Checkpoint at a time
@@ -123,6 +129,7 @@ func Open(ctx context.Context, st store.Store, cfg Config) (*Volume, error) {
 		dc:       newDirCache(cfg.DirCacheTTL),
 		mc:       newMemCache(cfg.MemberCache),
 		wc:       newMemCache(32 << 20),
+		rb:       newReadBuffer(cfg.ReadBuffer),
 		stg:      newStager(cfg.StateDir),
 	}
 	v.ctx, v.cancel = context.WithCancel(context.Background())
