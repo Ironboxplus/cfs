@@ -213,7 +213,11 @@ func runDataset(t *testing.T, e *env, files int) {
 					keep = append(keep, l)
 				}
 			}
-			t.Logf("server exited=%v code=%d; its log without the copy lines:\n%s", s.Exited(), s.Wait(), strings.Join(keep, "\n"))
+			code := -1
+			if s.Exited() { // Wait blocks while the process lives
+				code = s.Wait()
+			}
+			t.Logf("server exited=%v code=%d; its log without the copy lines:\n%s", s.Exited(), code, strings.Join(keep, "\n"))
 		}
 	}()
 	files, bytes := uploadTree(t, s.DAV, ref, "", 12)

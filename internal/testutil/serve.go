@@ -115,13 +115,17 @@ func (s *Server) WaitDrained(t testing.TB, d time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(d)
 	quiet := 0
+	var last []any
+	var lastErr error
 	for time.Now().Before(deadline) {
 		if s.Exited() {
 			t.Fatalf("server exited while waiting for the upload queue:\n%s", s.LogTail())
 		}
 		out, err := s.rc("vfs/queue", map[string]any{})
+		lastErr = err
 		if err == nil {
 			q, _ := out["queue"].([]any)
+			last = q
 			if len(q) == 0 {
 				quiet++
 				if quiet >= 4 {
@@ -133,7 +137,11 @@ func (s *Server) WaitDrained(t testing.TB, d time.Duration) {
 		}
 		time.Sleep(150 * time.Millisecond)
 	}
-	t.Fatalf("upload queue not empty after %v", d)
+	if len(last) > 5 {
+		last = last[:5]
+	}
+	s.DumpStacks() // the goroutines go to the process log, which the caller prints
+	t.Fatalf("upload queue not empty after %v: %d entries (first: %v), last rc error: %v", d, len(last), last, lastErr)
 }
 
 // Quit stops the server gracefully (exit handlers run: volumes are flushed and
