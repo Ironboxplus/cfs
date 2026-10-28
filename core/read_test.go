@@ -54,6 +54,11 @@ type probeOpen struct {
 
 var errInjected = errors.New("injected read error")
 
+// OpenStream counts like Open: the probe sees every body.
+func (p *probe) OpenStream(ctx context.Context, path string, off, n int64) (io.ReadCloser, error) {
+	return p.Open(ctx, path, off, n)
+}
+
 func (p *probe) Open(ctx context.Context, path string, off, n int64) (io.ReadCloser, error) {
 	if p.delay > 0 {
 		time.Sleep(p.delay)
@@ -362,41 +367,106 @@ func TestReadBigFileSurvivesABrokenBody(t *testing.T) {
 	}
 }
 
-// A reader that is open but not being read holds a read slot; uploads still get
-// theirs, and the reads never exceed ReadTransfers.
-func TestReadStalledReaderDoesNotBlockUploads(t *testing.T) {
+// Large files are streams: a client that opens one and does not read holds
+// nothing the other reads need. With more such streams open than there are read
+// slots, a packed read, a commit (which reads the lease) and an upload all still
+// complete; the bounded reads themselves never exceed ReadTransfers.
+func TestReadStalledStreamsDoNotHoldSlots(t *testing.T) {
 	ctx := context.Background()
-	e := newProbeEnv(t, aspect.GateOpts{Transfers: 1, ReadTransfers: 2}, nil)
-	e.put(t, "a.bin", randBytes(1<<20))
-	e.put(t, "b.bin", randBytes(1<<20))
-	var open []io.ReadCloser
-	for _, p := range []string{"a.bin", "b.bin"} {
-		rc, err := e.v.Open(ctx, p, 0, -1)
+	const slots = 2
+	e := newProbeEnv(t, aspect.GateOpts{Transfers: 1, ReadTransfers: slots}, func(c *core.Config) {
+		c.Ack = core.AckStaged
+		c.LeaseTTL = 600 * time.Millisecond // so that a commit reads the lease again
+	})
+	e.put(t, "big.bin", randBytes(1<<20))
+	small := randBytes(5000)
+	e.put(t, "small.bin", small)
+	if err := e.v.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var streams []io.ReadCloser
+	for i := 0; i < slots+3; i++ {
+		rc, err := e.v.Open(ctx, "big.bin", 0, -1)
 		if err != nil {
-			t.Fatal(err)
+			t.Fatalf("stream %d: %v", i, err)
 		}
 		rc.Read(make([]byte, 10)) // started, then left alone
-		open = append(open, rc)
+		streams = append(streams, rc)
 	}
-	pctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer func() {
+		for _, rc := range streams {
+			rc.Close()
+		}
+	}()
+	time.Sleep(300 * time.Millisecond) // past a sixth of the lease TTL
+	tctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
-	if _, err := e.v.Put(pctx, "c.bin", bytes.NewReader(randBytes(1<<20)), 1<<20, time.Now()); err != nil {
-		t.Fatalf("an upload waited for stalled readers: %v", err)
+	rc, err := e.v.Open(tctx, "small.bin", 0, -1)
+	if err != nil {
+		t.Fatalf("a packed read waited for stalled streams: %v", err)
 	}
-	// A third reader has to wait for a read slot.
-	short, cancelShort := context.WithTimeout(ctx, 300*time.Millisecond)
-	defer cancelShort()
-	if rc, err := e.v.Open(short, "c.bin", 0, -1); err == nil {
-		rc.Close()
-		t.Fatal("a third reader got a slot although ReadTransfers is 2")
+	got, err := io.ReadAll(rc)
+	rc.Close()
+	if err != nil || !bytes.Equal(got, small) {
+		t.Fatalf("packed read: %v", err)
 	}
-	for _, rc := range open {
-		rc.Close()
+	before := e.pr.opensOf("lease")
+	if _, err := e.v.Put(tctx, "c.bin", bytes.NewReader(randBytes(1<<20)), 1<<20, time.Now()); err != nil {
+		t.Fatalf("an upload waited for stalled streams: %v", err)
 	}
+	if _, err := e.v.Put(tctx, "d.txt", strings.NewReader("tiny"), 4, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.v.Flush(tctx); err != nil {
+		t.Fatalf("a commit waited for stalled streams: %v", err)
+	}
+	t.Logf("lease opens before %d, after %d; %d streams open", len(before), len(e.pr.opensOf("lease")), len(streams))
+	if s := e.meter.Snapshot(); s.PeakRead > slots {
+		t.Errorf("bounded reads peaked at %d, limit %d: %s", s.PeakRead, slots, s)
+	}
+}
+
+// Bounded reads (members) are limited to ReadTransfers at a time.
+func TestReadBoundedReadsRespectReadTransfers(t *testing.T) {
+	ctx := context.Background()
+	e := newProbeEnv(t, aspect.GateOpts{ReadTransfers: 2}, func(c *core.Config) {
+		c.Threshold = 1 << 20
+		c.MemberCache = -1
+		c.ReadWindow = -1
+	})
+	want := map[string][]byte{}
+	for i := 0; i < 12; i++ {
+		p := fmt.Sprintf("b/f%02d", i)
+		want[p] = randBytes(10000 + i)
+		e.put(t, p, want[p])
+	}
+	if err := e.v.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	e.pr.delay = 30 * time.Millisecond
+	e.meter.Reset()
+	var wg sync.WaitGroup
+	for p, w := range want {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			rc, err := e.v.Open(ctx, p, 0, -1)
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			got, err := io.ReadAll(rc)
+			rc.Close()
+			if err != nil || !bytes.Equal(got, w) {
+				t.Errorf("%s: %v", p, err)
+			}
+		}()
+	}
+	wg.Wait()
 	s := e.meter.Snapshot()
 	t.Logf("peaks: %s", s)
-	if s.PeakRead > 2 || s.PeakTransfer > 1 {
-		t.Errorf("peaks read=%d transfer=%d exceed the limits 2/1", s.PeakRead, s.PeakTransfer)
+	if s.PeakRead < 2 || s.PeakRead > 2 {
+		t.Errorf("bounded reads peaked at %d, want 2", s.PeakRead)
 	}
 }
 

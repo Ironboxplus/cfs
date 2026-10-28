@@ -143,6 +143,32 @@ func TestGateStalledReaderDoesNotBlockUploads(t *testing.T) {
 	}
 }
 
+// A stream holds a read slot during the call only, however long its consumer takes.
+func TestGateStreamHoldsNoSlotAfterOpen(t *testing.T) {
+	ctx := context.Background()
+	st := testutil.LocalStore(t, t.TempDir())
+	st.Put(ctx, "a", store.Bytes(make([]byte, 1<<16)), store.PutOpts{Size: 1 << 16})
+	g := aspect.Gate(st, aspect.GateOpts{ReadTransfers: 1})
+	var open []io.ReadCloser
+	for i := 0; i < 5; i++ {
+		rc, err := g.OpenStream(ctx, "a", 0, -1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		open = append(open, rc)
+	}
+	ctx2, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	rc, err := g.Open(ctx2, "a", 0, 1)
+	if err != nil {
+		t.Fatalf("a bounded read waited for open streams: %v", err)
+	}
+	rc.Close()
+	for _, rc := range open {
+		rc.Close()
+	}
+}
+
 func davStack(t *testing.T, attempts int) (store.Store, *aspect.Meter, *testutil.FaultProxy, string) {
 	drive := t.TempDir()
 	url, _ := testutil.WebDAVServer(t, drive)

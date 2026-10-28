@@ -20,7 +20,7 @@ type Class int
 const (
 	Meta     Class = iota // List/Stat/Remove/Move/DirMove/Mkdir/Rmdir/SetModTime/Hash
 	Transfer              // Put
-	Read                  // ranged Open: the body holds the slot until EOF or Close
+	Read                  // bounded reads (Open: the body holds the slot until EOF or Close) and the call of OpenStream
 )
 
 func (c Class) String() string {
@@ -64,8 +64,9 @@ type gate struct {
 
 // Gate limits the calls reaching s: at most MetaInflight metadata calls and at
 // most Transfers uploads and ReadTransfers open read bodies at a time. An upload
-// holds its slot until the Put returns; a read body holds its slot from Open until
-// the reader is closed (or hits EOF), so readers must close promptly.
+// holds its slot until the Put returns; a bounded read body holds its slot from
+// Open until the reader is closed (or hits EOF), so those readers must close
+// promptly; a stream (OpenStream) holds it during the call only.
 func Gate(s store.Store, o GateOpts) store.Store {
 	o.fill()
 	return &gate{Store: s, sem: [3]chan struct{}{
@@ -182,6 +183,19 @@ func (g *gate) Open(ctx context.Context, p string, off, n int64) (io.ReadCloser,
 		return nil, err
 	}
 	return &slotReader{rc: rc, release: func() { g.release(Read) }}, nil
+}
+
+// OpenStream takes a read slot for the call only (the link, the connection) and
+// gives it back when the call returns: the body is read at the pace of its
+// consumer, and a paused client must not keep a slot that bounded reads need.
+// (JuiceFS holds its download slot for one bounded block request only,
+// pkg/chunk/cached_store.go load.)
+func (g *gate) OpenStream(ctx context.Context, p string, off, n int64) (io.ReadCloser, error) {
+	if err := g.acquire(ctx, Read); err != nil {
+		return nil, err
+	}
+	defer g.release(Read)
+	return g.Store.OpenStream(ctx, p, off, n)
 }
 
 // slotReader returns its read slot at EOF or Close, whichever comes first.

@@ -106,6 +106,11 @@ func (r *retry) Open(ctx context.Context, p string, off, n int64) (out io.ReadCl
 	return
 }
 
+func (r *retry) OpenStream(ctx context.Context, p string, off, n int64) (out io.ReadCloser, err error) {
+	err = r.do(ctx, func() (e error) { out, e = r.Store.OpenStream(ctx, p, off, n); return }, nil)
+	return
+}
+
 func (r *retry) Hash(ctx context.Context, p string) (out string, err error) {
 	err = r.do(ctx, func() (e error) { out, e = r.Store.Hash(ctx, p); return }, nil)
 	return

@@ -61,6 +61,10 @@ func (r redact) Open(ctx context.Context, p string, off, n int64) (io.ReadCloser
 	v, err := r.Store.Open(ctx, p, off, n)
 	return v, scrubErr(err)
 }
+func (r redact) OpenStream(ctx context.Context, p string, off, n int64) (io.ReadCloser, error) {
+	v, err := r.Store.OpenStream(ctx, p, off, n)
+	return v, scrubErr(err)
+}
 func (r redact) Put(ctx context.Context, p string, src store.Source, o store.PutOpts) error {
 	return scrubErr(r.Store.Put(ctx, p, src, o))
 }

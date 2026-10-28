@@ -75,6 +75,12 @@ type Store interface {
 	Stat(ctx context.Context, p string) (Entry, error)
 	// Open reads n bytes from off (n < 0: to the end). The caller must Close it.
 	Open(ctx context.Context, p string, off, n int64) (io.ReadCloser, error)
+	// OpenStream is Open for a stream whose consumer sets the pace (a large file
+	// forwarded to a client that may pause for as long as it likes). Open is for
+	// bounded reads that are read and closed at once, and a decorator may keep a
+	// shared slot for them until the body is closed; a stream must not hold a shared
+	// resource while it is open, so a decorator may only limit the call itself.
+	OpenStream(ctx context.Context, p string, off, n int64) (io.ReadCloser, error)
 	// Put writes (or overwrites) a file, creating missing parent directories.
 	Put(ctx context.Context, p string, src Source, o PutOpts) error
 	Remove(ctx context.Context, p string) error

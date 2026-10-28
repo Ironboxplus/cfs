@@ -188,6 +188,12 @@ func (s *Store) Open(ctx context.Context, p string, off, n int64) (io.ReadCloser
 	return rc, nil
 }
 
+// OpenStream is Open: nothing here holds a slot for the body, and a break in the
+// middle is repaired by operations.Open either way.
+func (s *Store) OpenStream(ctx context.Context, p string, off, n int64) (io.ReadCloser, error) {
+	return s.Open(ctx, p, off, n)
+}
+
 func (s *Store) Put(ctx context.Context, p string, src store.Source, o store.PutOpts) error {
 	rc, err := src.Open()
 	if err != nil {

@@ -24,8 +24,8 @@ import (
 // (internal/stream GetRangeReaderFromLink): nothing is read ahead or buffered
 // here, and breaks in the middle of the body are repaired by the store below
 // (store/rclonestore reads through rclone's operations.Open, which reopens at the
-// byte where it stopped). The body holds a read slot of the gate until it ends
-// or is closed.
+// byte where it stopped). The store holds no slot for the body (OpenStream): a client
+// that pauses cannot starve the bounded reads.
 //
 // A packed or staged file is a member of bounded size (below Threshold): it is
 // read, decoded and verified as a whole, as restic and JuiceFS read their blocks.
@@ -82,7 +82,7 @@ func (v *Volume) Open(ctx context.Context, p string, off, n int64) (io.ReadClose
 	if off >= end {
 		return io.NopCloser(bytes.NewReader(nil)), nil
 	}
-	return v.st.Open(ctx, p, off, end-off)
+	return v.st.OpenStream(ctx, p, off, end-off)
 }
 
 func sliceReader(data []byte, off, n int64) io.ReadCloser {
