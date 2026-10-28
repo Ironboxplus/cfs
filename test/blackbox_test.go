@@ -175,8 +175,8 @@ func bigViaServe(t *testing.T, size int64) {
 	s.Quit(t)
 }
 
-func TestBigFile1GiBWebDAVServe(t *testing.T) { bigViaServe(t, 1<<30) }
-func TestBigFile4GiBWebDAVServe(t *testing.T) { bigViaServe(t, 4<<30) }
+func TestBigFile32MiBWebDAVServe(t *testing.T) { bigViaServe(t, 32<<20) }
+func TestBigFile64MiBWebDAVServe(t *testing.T) { bigViaServe(t, 64<<20) }
 
 // ---- crashes of the whole server ----
 

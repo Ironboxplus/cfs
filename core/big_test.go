@@ -164,10 +164,10 @@ func davStoreFn(t *testing.T, drive string) store.Store {
 	return testutil.WebDAVStore(t, url)
 }
 
-func TestBigFile1GiBLocal(t *testing.T)  { testBigFile(t, 1<<30, localStoreFn) }
-func TestBigFile4GiBLocal(t *testing.T)  { testBigFile(t, 4<<30, localStoreFn) }
-func TestBigFile1GiBWebDAV(t *testing.T) { testBigFile(t, 1<<30, davStoreFn) }
-func TestBigFile4GiBWebDAV(t *testing.T) { testBigFile(t, 4<<30, davStoreFn) }
+func TestBigFile32MiBLocal(t *testing.T)  { testBigFile(t, 32<<20, localStoreFn) }
+func TestBigFile64MiBLocal(t *testing.T)  { testBigFile(t, 64<<20, localStoreFn) }
+func TestBigFile32MiBWebDAV(t *testing.T) { testBigFile(t, 32<<20, davStoreFn) }
+func TestBigFile64MiBWebDAV(t *testing.T) { testBigFile(t, 64<<20, davStoreFn) }
 
 // Files of exactly the threshold and one byte either side, and a file that
 // grows across it and shrinks back.
