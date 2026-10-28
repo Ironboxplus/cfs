@@ -257,8 +257,19 @@ func TestServerCrashKeepsAcknowledgedUploads(t *testing.T) {
 			acked := pushAll(s.DAV, ups, 6)
 			// Let the crash happen even if the client finished first.
 			deadline := time.Now().Add(20 * time.Second)
-			for cp != "random" && !s.Exited() && time.Now().Before(deadline) {
-				time.Sleep(100 * time.Millisecond)
+			// How many packs 400 uploads make depends on how fast they go, and the numbered
+			// crash points need that many: keep writing filler files (never counted)
+			// until the server reaches its crash point.
+			for round := 0; cp != "random" && !s.Exited() && time.Now().Before(deadline); round++ {
+				filler := makeUploads(20, uint64(1000+round))
+				for i := range filler {
+					filler[i].p = fmt.Sprintf("filler/d%d/r%03d-%02d.dat", i%3, round, i)
+					if len(filler[i].data) > 100000 {
+						filler[i].data = filler[i].data[:100000]
+					}
+				}
+				pushAll(s.DAV, filler, 4)
+				time.Sleep(200 * time.Millisecond)
 			}
 			if cp != "random" {
 				if !s.Exited() {
