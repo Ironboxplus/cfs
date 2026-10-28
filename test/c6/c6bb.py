@@ -579,7 +579,8 @@ class Mutator:
         step("shrink large", shrink)
 
         def delete():
-            pool = [k for k in sorted(m) if k in small]
+            small_set = set(small)
+            pool = [k for k in sorted(m) if k in small_set]
             n = max(1, round(len(m) * 0.005))
             picked = self.take(pool, n)
             for k in picked:

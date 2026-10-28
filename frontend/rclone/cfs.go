@@ -72,12 +72,12 @@ func init() {
 			Advanced: true,
 		}, {
 			Name:     "seal_quiet",
-			Help:     "Seal the open pack when no small file arrived for this long. 0: 10s with ack=staged (a pause that ends a burst), 2s with ack=durable.",
+			Help:     "Seal the open pack when no small file arrived for this long. 0: 30s with ack=staged (a pause that ends a burst), 2s with ack=durable.",
 			Default:  fs.Duration(0),
 			Advanced: true,
 		}, {
 			Name:     "seal_max",
-			Help:     "Seal the open pack this long after its first file. 0: 60s with ack=staged, 15s with ack=durable.",
+			Help:     "Seal the open pack this long after its first file. 0: 10 minutes with ack=staged, 15s with ack=durable.",
 			Default:  fs.Duration(0),
 			Advanced: true,
 		}, {
@@ -107,8 +107,8 @@ func init() {
 			Advanced: true,
 		}, {
 			Name:     "lease_ttl",
-			Help:     "A writer whose heartbeat is older than this is considered dead.",
-			Default:  fs.Duration(60 * time.Second),
+			Help:     "A writer whose heartbeat is older than this is considered dead. The heartbeat (a read and a write of the lease on the remote) runs every third of it.",
+			Default:  fs.Duration(30 * time.Minute),
 			Advanced: true,
 		}, {
 			Name:     "gc_grace",

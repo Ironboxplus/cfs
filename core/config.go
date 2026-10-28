@@ -69,7 +69,7 @@ type Config struct {
 	// SealMax seals it this long after its first file. Defaults: 2s and 15s with
 	// AckDurable, where callers wait for the commit. With AckStaged nobody
 	// waits, so a short quiet period would only cut small packs out of a slow
-	// stream of files: the defaults are 10s (a pause that ends a burst) and 60s
+	// stream of files: the defaults are 30s (a pause that ends a burst) and 10 minutes
 	// (the longest a file waits for its pack; Flush, Close and any operation
 	// that touches a staged name seal at once, and so does a full staging area).
 	SealQuiet time.Duration
@@ -83,7 +83,8 @@ type Config struct {
 	// large files and directories. Default 5 minutes.
 	DirCacheTTL time.Duration
 	// LeaseTTL: a lease whose heartbeat is older than this is considered dead
-	// and may be taken over. Default 60s.
+	// and may be taken over. The heartbeat runs every LeaseTTL/3. Default 30
+	// minutes: every heartbeat is a read and a write on the drive.
 	LeaseTTL time.Duration
 	// GCGrace: how long an unreferenced pack, old log segment or checkpoint is
 	// kept before it may be deleted. Default 24h.
@@ -137,13 +138,13 @@ func (c *Config) fill() error {
 	if c.SealQuiet <= 0 {
 		c.SealQuiet = 2 * time.Second
 		if staged {
-			c.SealQuiet = 10 * time.Second
+			c.SealQuiet = 30 * time.Second
 		}
 	}
 	if c.SealMax <= 0 {
 		c.SealMax = 15 * time.Second
 		if staged {
-			c.SealMax = time.Minute
+			c.SealMax = 10 * time.Minute
 		}
 	}
 	if c.ReadChunk <= 0 {
@@ -156,7 +157,7 @@ func (c *Config) fill() error {
 		c.DirCacheTTL = 5 * time.Minute
 	}
 	if c.LeaseTTL <= 0 {
-		c.LeaseTTL = 60 * time.Second
+		c.LeaseTTL = 30 * time.Minute
 	}
 	if c.GCGrace <= 0 {
 		c.GCGrace = 24 * time.Hour

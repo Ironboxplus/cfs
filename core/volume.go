@@ -91,6 +91,7 @@ type Volume struct {
 	ckptOne sync.Mutex // one Checkpoint at a time
 
 	leaseMu sync.Mutex
+	leaseAt atomic.Int64 // unix nanos of the last successful read or write of the lease
 }
 
 func (v *Volume) logf(format string, args ...any) { v.cfg.Logf(format, args...) }
@@ -313,6 +314,7 @@ func (v *Volume) readLease(ctx context.Context) (lease, bool, error) {
 		err = json.NewDecoder(rc).Decode(&l)
 		rc.Close()
 		if err == nil {
+			v.leaseAt.Store(time.Now().UnixNano())
 			return l, true, nil
 		}
 		lastErr = err
@@ -328,7 +330,11 @@ func (v *Volume) writeLease(ctx context.Context, released bool) error {
 	l := lease{Writer: v.writerID, Epoch: v.epoch, Heartbeat: time.Now().UnixMilli(), Released: released}
 	l.Host, _ = os.Hostname()
 	b, _ := json.Marshal(l)
-	return v.st.Put(ctx, leasePath, store.Bytes(b), store.PutOpts{Size: int64(len(b)), ModTime: time.Now()})
+	err := v.st.Put(ctx, leasePath, store.Bytes(b), store.PutOpts{Size: int64(len(b)), ModTime: time.Now()})
+	if err == nil {
+		v.leaseAt.Store(time.Now().UnixNano())
+	}
+	return err
 }
 
 // maxDriveEpoch is the highest epoch visible on the drive.
@@ -403,7 +409,19 @@ func (v *Volume) releaseLease(ctx context.Context) error {
 
 // checkLease re-reads the lease and fences this writer if a newer epoch or a
 // different writer holds it. Called before every commit.
+//
+// A read less than LeaseTTL/6 after the last successful read or write of the
+// lease is skipped. Another writer can only take over after our heartbeat has
+// failed for longer than LeaseTTL, so by then the last success is older than
+// LeaseTTL/6 and the check before the next commit reads for real and fences.
 func (v *Volume) checkLease(ctx context.Context) error {
+	if at := v.leaseAt.Load(); at != 0 && time.Since(time.Unix(0, at)) < v.cfg.LeaseTTL/6 {
+		return nil
+	}
+	return v.readCheckLease(ctx)
+}
+
+func (v *Volume) readCheckLease(ctx context.Context) error {
 	l, ok, err := v.readLease(ctx)
 	if err != nil {
 		return err
@@ -426,7 +444,7 @@ func (v *Volume) heartbeatLoop() {
 		case <-t.C:
 		}
 		v.leaseMu.Lock()
-		err := v.checkLease(v.ctx)
+		err := v.readCheckLease(v.ctx)
 		if err == nil {
 			err = v.writeLease(v.ctx, false)
 		}

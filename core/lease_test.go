@@ -151,6 +151,9 @@ func TestFencedWriterStops(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(drive, ".cfs", "lease.json"), lease, 0o644); err != nil {
 		t.Fatal(err)
 	}
+	// A commit within LeaseTTL/6 of the last lease access skips the read; a real
+	// takeover needs the TTL to pass, so wait past that.
+	time.Sleep(700 * time.Millisecond)
 	_, err = a.Put(ctx, "late.txt", strings.NewReader("too late"), 8, time.Now())
 	if err == nil {
 		// Acknowledged from the staging area: the commit is what finds out.
