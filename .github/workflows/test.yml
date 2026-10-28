@@ -32,7 +32,7 @@ jobs:
     outputs:
       matrix: ${{ steps.m.outputs.matrix }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - id: m
         run: echo "matrix=$(bash ci/matrix.sh)" >> "$GITHUB_OUTPUT"
 
@@ -41,12 +41,52 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - name: Get runner parameters
+        id: rp
+        run: |
+          echo "year-week=$(date -u "+%Y%V")" >> "$GITHUB_OUTPUT"
+          echo "os-version=$ImageOS" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v7
+      - id: setup-go
+        uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
-          cache-dependency-path: go.sum
+          # Caching is done below, as rclone's CI does (.github/workflows/build.yml):
+          # setup-go's own cache keys only on go.sum, so every matrix job collides on
+          # one key and only the first to finish saves its build cache.
+          cache: false
+      - name: Go paths
+        id: go-paths
+        run: |
+          echo "build-cache=$(go env GOCACHE)" >> "$GITHUB_OUTPUT"
+          echo "mod-cache=$(go env GOMODCACHE)" >> "$GITHUB_OUTPUT"
+      # Downloaded module source is the same for every job: one shared key.
+      - name: Module cache
+        uses: actions/cache@v6
+        with:
+          path: ${{ steps.go-paths.outputs.mod-cache }}
+          key: go-mod-${{ steps.rp.outputs.year-week }}-${{ hashFiles('go.sum') }}
+          restore-keys: |
+            go-mod-${{ steps.rp.outputs.year-week }}-
+            go-mod-
+      # Compiled packages depend on the OS and Go version and on what the job builds: one key per job.
+      - name: Build cache
+        uses: actions/cache@v6
+        with:
+          path: ${{ steps.go-paths.outputs.build-cache }}
+          key: go-build-check-${{ steps.rp.outputs.os-version }}-go${{ steps.setup-go.outputs.go-version }}-${{ steps.rp.outputs.year-week }}-${{ hashFiles('go.sum') }}
+          restore-keys: |
+            go-build-check-${{ steps.rp.outputs.os-version }}-go${{ steps.setup-go.outputs.go-version }}-${{ steps.rp.outputs.year-week }}-
+            go-build-check-${{ steps.rp.outputs.os-version }}-go${{ steps.setup-go.outputs.go-version }}-
+      # The patched rclone tree only changes with the patches.
+      - name: rclone fork cache
+        id: rclone-cache
+        uses: actions/cache@v6
+        with:
+          path: ../rclone-fork
+          key: rclone-fork-v1.75.2-${{ hashFiles('ci/rclone-patches/*.patch', 'ci/setup-rclone.sh') }}
       - name: rclone fork (v1.75.2 + ci/rclone-patches)
+        if: steps.rclone-cache.outputs.cache-hit != 'true'
         run: bash ci/setup-rclone.sh
       - run: go build ./...
       - run: GOOS=windows go build ./...
@@ -58,6 +98,13 @@ jobs:
           if [ -n "$out" ]; then echo "not formatted:"; echo "$out"; exit 1; fi
       - name: every test is in a job
         run: bash ci/check-groups.sh
+      - name: Trim module cache before it is saved
+        if: always()
+        run: |
+          # The module .zip archives aren't needed to build from the extracted tree
+          # (rclone's CI does the same); dropping them roughly halves the cache.
+          modcache=$(go env GOMODCACHE | tr '\\' '/')
+          find "$modcache/cache/download" -name '*.zip' -type f -delete 2>/dev/null || true
 
   test:
     needs: plan
@@ -69,12 +116,52 @@ jobs:
       matrix:
         include: ${{ fromJSON(needs.plan.outputs.matrix) }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - name: Get runner parameters
+        id: rp
+        run: |
+          echo "year-week=$(date -u "+%Y%V")" >> "$GITHUB_OUTPUT"
+          echo "os-version=$ImageOS" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v7
+      - id: setup-go
+        uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
-          cache-dependency-path: go.sum
+          # Caching is done below, as rclone's CI does (.github/workflows/build.yml):
+          # setup-go's own cache keys only on go.sum, so every matrix job collides on
+          # one key and only the first to finish saves its build cache.
+          cache: false
+      - name: Go paths
+        id: go-paths
+        run: |
+          echo "build-cache=$(go env GOCACHE)" >> "$GITHUB_OUTPUT"
+          echo "mod-cache=$(go env GOMODCACHE)" >> "$GITHUB_OUTPUT"
+      # Downloaded module source is the same for every job: one shared key.
+      - name: Module cache
+        uses: actions/cache@v6
+        with:
+          path: ${{ steps.go-paths.outputs.mod-cache }}
+          key: go-mod-${{ steps.rp.outputs.year-week }}-${{ hashFiles('go.sum') }}
+          restore-keys: |
+            go-mod-${{ steps.rp.outputs.year-week }}-
+            go-mod-
+      # Compiled packages depend on the OS and Go version and on what the job builds: one key per job.
+      - name: Build cache
+        uses: actions/cache@v6
+        with:
+          path: ${{ steps.go-paths.outputs.build-cache }}
+          key: go-build-${{ matrix.name }}-${{ matrix.os }}-${{ steps.rp.outputs.os-version }}-go${{ steps.setup-go.outputs.go-version }}-${{ steps.rp.outputs.year-week }}-${{ hashFiles('go.sum') }}
+          restore-keys: |
+            go-build-${{ matrix.name }}-${{ matrix.os }}-${{ steps.rp.outputs.os-version }}-go${{ steps.setup-go.outputs.go-version }}-${{ steps.rp.outputs.year-week }}-
+            go-build-${{ matrix.name }}-${{ matrix.os }}-${{ steps.rp.outputs.os-version }}-go${{ steps.setup-go.outputs.go-version }}-
+      # The patched rclone tree only changes with the patches.
+      - name: rclone fork cache
+        id: rclone-cache
+        uses: actions/cache@v6
+        with:
+          path: ../rclone-fork
+          key: rclone-fork-v1.75.2-${{ hashFiles('ci/rclone-patches/*.patch', 'ci/setup-rclone.sh') }}
       - name: rclone fork (v1.75.2 + ci/rclone-patches)
+        if: steps.rclone-cache.outputs.cache-hit != 'true'
         run: bash ci/setup-rclone.sh
       - name: go test
         env:
@@ -87,7 +174,7 @@ jobs:
       - name: tail of the log
         if: failure()
         run: tail -c 200000 "$RUNNER_TEMP/test.log" > "$RUNNER_TEMP/test-tail.log" || true
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: failure()
         with:
           name: log-${{ matrix.name }}-${{ matrix.os }}
@@ -95,18 +182,66 @@ jobs:
           retention-days: 7
           if-no-files-found: ignore
 
+      - name: Trim module cache before it is saved
+        if: always()
+        run: |
+          # The module .zip archives aren't needed to build from the extracted tree
+          # (rclone's CI does the same); dropping them roughly halves the cache.
+          modcache=$(go env GOMODCACHE | tr '\\' '/')
+          find "$modcache/cache/download" -name '*.zip' -type f -delete 2>/dev/null || true
+
   # Manual only: bigger models, big files, the whole-tree dataset over WebDAV, durable ack.
   long:
     if: github.event_name == 'workflow_dispatch' && inputs.long
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - name: Get runner parameters
+        id: rp
+        run: |
+          echo "year-week=$(date -u "+%Y%V")" >> "$GITHUB_OUTPUT"
+          echo "os-version=$ImageOS" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v7
+      - id: setup-go
+        uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
-          cache-dependency-path: go.sum
+          # Caching is done below, as rclone's CI does (.github/workflows/build.yml):
+          # setup-go's own cache keys only on go.sum, so every matrix job collides on
+          # one key and only the first to finish saves its build cache.
+          cache: false
+      - name: Go paths
+        id: go-paths
+        run: |
+          echo "build-cache=$(go env GOCACHE)" >> "$GITHUB_OUTPUT"
+          echo "mod-cache=$(go env GOMODCACHE)" >> "$GITHUB_OUTPUT"
+      # Downloaded module source is the same for every job: one shared key.
+      - name: Module cache
+        uses: actions/cache@v6
+        with:
+          path: ${{ steps.go-paths.outputs.mod-cache }}
+          key: go-mod-${{ steps.rp.outputs.year-week }}-${{ hashFiles('go.sum') }}
+          restore-keys: |
+            go-mod-${{ steps.rp.outputs.year-week }}-
+            go-mod-
+      # Compiled packages depend on the OS and Go version and on what the job builds: one key per job.
+      - name: Build cache
+        uses: actions/cache@v6
+        with:
+          path: ${{ steps.go-paths.outputs.build-cache }}
+          key: go-build-long-${{ steps.rp.outputs.os-version }}-go${{ steps.setup-go.outputs.go-version }}-${{ steps.rp.outputs.year-week }}-${{ hashFiles('go.sum') }}
+          restore-keys: |
+            go-build-long-${{ steps.rp.outputs.os-version }}-go${{ steps.setup-go.outputs.go-version }}-${{ steps.rp.outputs.year-week }}-
+            go-build-long-${{ steps.rp.outputs.os-version }}-go${{ steps.setup-go.outputs.go-version }}-
+      # The patched rclone tree only changes with the patches.
+      - name: rclone fork cache
+        id: rclone-cache
+        uses: actions/cache@v6
+        with:
+          path: ../rclone-fork
+          key: rclone-fork-v1.75.2-${{ hashFiles('ci/rclone-patches/*.patch', 'ci/setup-rclone.sh') }}
       - name: rclone fork (v1.75.2 + ci/rclone-patches)
+        if: steps.rclone-cache.outputs.cache-hit != 'true'
         run: bash ci/setup-rclone.sh
       - name: staged ack
         env:
@@ -130,10 +265,17 @@ jobs:
             [ -f "$RUNNER_TEMP/$f.log" ] && tail -c 100000 "$RUNNER_TEMP/$f.log" > "$RUNNER_TEMP/$f-tail.log"
           done
           true
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: failure()
         with:
           name: long-logs
           path: ${{ runner.temp }}/*-tail.log
           retention-days: 7
           if-no-files-found: ignore
+      - name: Trim module cache before it is saved
+        if: always()
+        run: |
+          # The module .zip archives aren't needed to build from the extracted tree
+          # (rclone's CI does the same); dropping them roughly halves the cache.
+          modcache=$(go env GOMODCACHE | tr '\\' '/')
+          find "$modcache/cache/download" -name '*.zip' -type f -delete 2>/dev/null || true
