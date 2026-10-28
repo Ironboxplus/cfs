@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -226,6 +227,39 @@ func (o *OpenList) Stats() aspect.Stats {
 	return st
 }
 
+// Staged is the number of acknowledged small files the volume has not put on
+// the drive yet, as of the last stats file.
+func (o *OpenList) Staged() (files int, bytes int64) {
+	var st struct {
+		StagedFiles int
+		StagedBytes int64
+	}
+	if b, err := os.ReadFile(o.StatsFile); err == nil {
+		json.Unmarshal(b, &st)
+	}
+	return st.StagedFiles, st.StagedBytes
+}
+
+// WaitDrained waits until nothing is staged any more (the stats file is
+// written every 300 ms, so this looks at it twice in a row).
+func (o *OpenList) WaitDrained(t testing.TB, d time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(d)
+	zero := 0
+	for time.Now().Before(deadline) {
+		if n, _ := o.Staged(); n == 0 {
+			if zero++; zero >= 3 {
+				return
+			}
+		} else {
+			zero = 0
+		}
+		time.Sleep(350 * time.Millisecond)
+	}
+	n, b := o.Staged()
+	t.Fatalf("%d files (%d bytes) still staged after %v", n, b, d)
+}
+
 // StatsString is Stats formatted for a test log.
 func (o *OpenList) StatsString() string { return strings.TrimSpace(o.Stats().String()) }
 
@@ -245,4 +279,30 @@ func (o *OpenList) ensureDavUser(t testing.TB) {
 			t.Fatalf("create webdav user: %v", out["message"])
 		}
 	}
+}
+
+// APIPut uploads a file with PUT /api/fs/put as admin (the web UI's and the
+// API's way in): dst is the full OpenList path.
+func (o *OpenList) APIPut(dst string, data []byte) error {
+	req, err := http.NewRequest("PUT", fmt.Sprintf("http://127.0.0.1:%d/api/fs/put", o.Port), bytes.NewReader(data))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", o.token)
+	req.Header.Set("File-Path", url.PathEscape(dst))
+	req.Header.Set("Content-Type", "application/octet-stream")
+	req.ContentLength = int64(len(data))
+	resp, err := (&http.Client{Timeout: 2 * time.Minute}).Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	var out map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return fmt.Errorf("PUT %s: HTTP %d, not JSON", dst, resp.StatusCode)
+	}
+	if c, _ := out["code"].(float64); c != 200 {
+		return fmt.Errorf("PUT %s: code %v: %v", dst, out["code"], out["message"])
+	}
+	return nil
 }

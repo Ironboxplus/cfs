@@ -9,6 +9,8 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -92,9 +94,30 @@ func (e *opEnv) checkPeaks(t *testing.T, meta, transfers int) {
 	}
 }
 
+// TestOpenListCfsDataset copies the OP-sync tree into a cfs storage through
+// OpenList's WebDAV (the storage driver path: the same Put serves the API, the
+// WebDAV, S3 and the sync jobs), with the caller concurrency of a sync job (4),
+// of a browser (3) and of the earlier bulk run (12), in both ack modes, and
+// reports how many packs and log segments that made.
 func TestOpenListCfsDataset(t *testing.T) {
+	for _, c := range []struct {
+		mode      string
+		uploaders int
+	}{{"staged", 3}, {"staged", 12}, {"durable", 12}} {
+		t.Run(fmt.Sprintf("%s/%d-uploads", c.mode, c.uploaders), func(t *testing.T) {
+			add := map[string]any{"ack": c.mode}
+			if c.mode == "staged" {
+				// Nothing waits for a pack: seal after a 2 s pause or 30 s.
+				add["seal_quiet"], add["seal_max"] = "2s", "30s"
+			}
+			datasetRun(t, c.mode, c.uploaders, add)
+		})
+	}
+}
+
+func datasetRun(t *testing.T, mode string, uploaders int, add map[string]any) {
 	src := datasetSource(t)
-	e := newOpEnv(t, nil)
+	e := newOpEnv(t, add)
 	refDir := filepath.Join(t.TempDir(), "ref")
 	os.MkdirAll(refDir, 0o755)
 	copyTree(t, src, refDir)
@@ -102,11 +125,15 @@ func TestOpenListCfsDataset(t *testing.T) {
 	dav := e.cfs()
 
 	t0 := time.Now()
-	files, nbytes := uploadTree(t, dav, ref, "", 12)
-	t.Logf("uploaded %d files, %d bytes through OpenList WebDAV in %v", files, nbytes, time.Since(t0))
+	files, nbytes := uploadTree(t, dav, ref, "", uploaders)
+	t.Logf("uploaded %d files, %d bytes through OpenList WebDAV in %v (%d uploaders, ack=%s)", files, nbytes, time.Since(t0), uploaders, mode)
+	if n, b := e.o.Staged(); mode == "staged" {
+		t.Logf("right after the last upload: %d files / %d bytes acknowledged but not on the drive yet", n, b)
+		e.o.WaitDrained(t, 3*time.Minute)
+	}
 	e.logStats(t, "after upload")
 	packs, segs, big, dbytes := e.drive(t)
-	t.Logf("underlying storage now holds %d packs, %d log/checkpoint files, %d large files, %d bytes (from %d files)", packs, segs, big, dbytes, files)
+	t.Logf("RESULT ack=%s uploaders=%d: underlying storage holds %d packs, %d log/checkpoint files, %d large files, %d bytes (from %d files)", mode, uploaders, packs, segs, big, dbytes, files)
 	if packs+segs+big >= files/4 {
 		t.Errorf("packing did not reduce the file count: %d objects for %d files", packs+segs+big, files)
 	}
@@ -177,7 +204,12 @@ func TestOpenListCfsDataset(t *testing.T) {
 	n, b = ref.Compare(t, dav, "", true)
 	t.Logf("after kill -9 and restart: verified %d files, %d bytes", n, b)
 
-	// Lose the local index too: it is rebuilt from the drive.
+	// Lose the local index too: it is rebuilt from the drive. What was staged
+	// when the process died has to be on the drive first, or losing the local
+	// disk would lose it (that is the one thing the staged mode can lose).
+	if mode == "staged" {
+		e.o.WaitDrained(t, 3*time.Minute)
+	}
 	e.o.Kill()
 	state := filepath.Join(e.data, "cfs")
 	if err := os.RemoveAll(state); err != nil {
@@ -426,4 +458,68 @@ func TestOpenListCfsMount(t *testing.T) {
 	})
 	e.logStats(t, "mount")
 	e.checkPeaks(t, 1, 8)
+}
+
+// The web UI / API way in: three callers PUT 900 small files with
+// /api/fs/put. Staged, the packs follow the bytes; the file count and the
+// callers don't matter. Both ack modes are counted.
+func TestOpenListCfsAPIPut(t *testing.T) {
+	const files, callers = 900, 3
+	var total int64
+	res := map[string][2]int{}
+	for _, mode := range []string{"staged", "durable"} {
+		t.Run(mode, func(t *testing.T) {
+			add := map[string]any{"ack": mode, "pack_max_bytes": "512KiB"}
+			if mode == "staged" {
+				add["seal_quiet"], add["seal_max"] = "2s", "60s"
+			}
+			e := newOpEnv(t, add)
+			rng := rand.New(rand.NewPCG(31, 32))
+			datas := make([][]byte, files)
+			total = 0
+			for i := range datas {
+				datas[i] = randData(rng, 200+rng.IntN(3000))
+				total += int64(len(datas[i]))
+			}
+			e.cfs().MkcolAll("api")
+			var wg sync.WaitGroup
+			var next atomic.Int64
+			for c := 0; c < callers; c++ {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					for {
+						i := int(next.Add(1)) - 1
+						if i >= files {
+							return
+						}
+						if err := e.o.APIPut(fmt.Sprintf("/cfs/api/f%04d", i), datas[i]); err != nil {
+							t.Errorf("put %d: %v", i, err)
+							return
+						}
+					}
+				}()
+			}
+			wg.Wait()
+			if mode == "staged" {
+				e.o.WaitDrained(t, 2*time.Minute)
+			}
+			packs, segs, _, _ := e.drive(t)
+			res[mode] = [2]int{packs, segs}
+			t.Logf("RESULT API put ack=%s: %d files (%d bytes) from %d callers -> %d packs, %d log segments", mode, files, total, callers, packs, segs)
+			for i := 0; i < files; i += 41 {
+				got, err := e.cfs().Get(fmt.Sprintf("api/f%04d", i))
+				if err != nil || string(got) != string(datas[i]) {
+					t.Fatalf("file %d wrong: %v", i, err)
+				}
+			}
+			if mode == "staged" {
+				if want := int(total/(512<<10)) + 1; packs > want+3 {
+					t.Errorf("staged: %d packs for %d bytes, want about %d", packs, total, want)
+				}
+			}
+			e.checkPeaks(t, 1, 8)
+		})
+	}
+	t.Logf("packs / segments: staged %v, durable %v", res["staged"], res["durable"])
 }

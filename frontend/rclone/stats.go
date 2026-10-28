@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Ironboxplus/cfs/aspect"
 	"github.com/rclone/rclone/lib/atexit"
 )
 
@@ -34,7 +35,13 @@ func startStats(ref *volRef) {
 		return
 	}
 	write := func() {
-		b, err := json.Marshal(ref.meter.Snapshot())
+		files, bytes := ref.v.Staged()
+		b, err := json.Marshal(struct {
+			aspect.Stats
+			// Acknowledged small files that are not on the drive yet.
+			StagedFiles int
+			StagedBytes int64
+		}{ref.meter.Snapshot(), files, bytes})
 		if err != nil {
 			return
 		}

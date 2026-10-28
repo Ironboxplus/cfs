@@ -60,14 +60,25 @@ func init() {
 			Default:  10000,
 			Advanced: true,
 		}, {
+			Name:     "ack",
+			Help:     "When a write of a small file returns. \"staged\": the data is on the local disk (state_dir) and is packed and uploaded in the background, so a pack holds everything that arrived in the seal window however few files are written at once; only losing the local disk before the upload loses acknowledged data. \"durable\": the write returns when its pack is on the remote (one pack per few concurrent writes).",
+			Default:  "staged",
+			Advanced: true,
+			Examples: []fs.OptionExample{{Value: "staged", Help: "Acknowledge from the local staging area."}, {Value: "durable", Help: "Acknowledge when the data is on the remote."}},
+		}, {
+			Name:     "stage_max_bytes",
+			Help:     "Most data waiting in the staging area (ack=staged). Writes wait while it is full.",
+			Default:  fs.SizeSuffix(1 << 30),
+			Advanced: true,
+		}, {
 			Name:     "seal_quiet",
-			Help:     "Seal the open pack when no small file arrived for this long.",
-			Default:  fs.Duration(2 * time.Second),
+			Help:     "Seal the open pack when no small file arrived for this long. 0: 10s with ack=staged (a pause that ends a burst), 2s with ack=durable.",
+			Default:  fs.Duration(0),
 			Advanced: true,
 		}, {
 			Name:     "seal_max",
-			Help:     "Seal the open pack this long after its first file.",
-			Default:  fs.Duration(15 * time.Second),
+			Help:     "Seal the open pack this long after its first file. 0: 60s with ack=staged, 15s with ack=durable.",
+			Default:  fs.Duration(0),
 			Advanced: true,
 		}, {
 			Name:     "meta_inflight",
@@ -125,6 +136,8 @@ type Options struct {
 	Threshold       fs.SizeSuffix `config:"threshold"`
 	PackMaxBytes    fs.SizeSuffix `config:"pack_max_bytes"`
 	PackMaxFiles    int           `config:"pack_max_files"`
+	Ack             string        `config:"ack"`
+	StageMaxBytes   fs.SizeSuffix `config:"stage_max_bytes"`
 	SealQuiet       fs.Duration   `config:"seal_quiet"`
 	SealMax         fs.Duration   `config:"seal_max"`
 	MetaInflight    int           `config:"meta_inflight"`
@@ -218,6 +231,8 @@ func openRef(ctx context.Context, key string, under func() (fs.Fs, error), opt *
 		Threshold:       int64(opt.Threshold),
 		PackMaxBytes:    int64(opt.PackMaxBytes),
 		PackMaxFiles:    opt.PackMaxFiles,
+		Ack:             core.AckMode(opt.Ack),
+		StageMaxBytes:   int64(opt.StageMaxBytes),
 		SealQuiet:       time.Duration(opt.SealQuiet),
 		SealMax:         time.Duration(opt.SealMax),
 		ReadChunk:       int64(opt.ReadChunk),
