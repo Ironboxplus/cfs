@@ -153,10 +153,7 @@ func testBigFile(t *testing.T, size int64, mkStore func(t *testing.T, drive stri
 	if s.PeakMeta > 1 || s.PeakTransfer > 8 {
 		t.Errorf("in-flight peaks exceed limits: %s", s)
 	}
-	// One ranged request per read, whatever its length: the full read plus the ranges.
-	if want := int64(1 + len(offs)); s.Calls["open"] != want {
-		t.Errorf("%d reads made %d range requests", want, s.Calls["open"])
-	}
+	// (That one read is one ranged request is checked in TestReadBigFileIsOneRangeAndStartsAtOnce.)
 }
 
 func localStoreFn(t *testing.T, drive string) store.Store { return testutil.LocalStore(t, drive) }

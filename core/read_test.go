@@ -549,19 +549,26 @@ func TestReadFsckStreamsThePack(t *testing.T) {
 		return rep
 	}
 	fsck() // warm up
+	// What a fsck allocates apart from reading packs, to be taken off the deep one.
+	base := allocDelta(func() {
+		if _, err := e.v.Fsck(ctx, core.FsckOpts{}); err != nil {
+			t.Fatal(err)
+		}
+	})
 	e.pr.reset()
 	var rep core.FsckReport
-	delta := allocDelta(func() { rep = fsck() })
+	deepDelta := allocDelta(func() { rep = fsck() })
+	delta := deepDelta - min(deepDelta, base)
 	ops := e.pr.opensOf("packs/")
-	t.Logf("deep fsck of a %d MiB pack: %d bytes allocated, %d opens of the pack, problems %v", fi.Size()>>20, delta, len(ops), rep.Problems)
+	t.Logf("deep fsck of a %d MiB pack: %d bytes allocated (%d without the pack check), %d opens of the pack, problems %v", fi.Size()>>20, deepDelta, base, len(ops), rep.Problems)
 	if !rep.OK() {
 		t.Fatalf("clean pack reported: %v", rep.Problems)
 	}
 	if len(ops) != 1 {
 		t.Errorf("%d store opens for one pack, want 1", len(ops))
 	}
-	if limit := uint64(4<<20 + member + 1<<20); delta > limit {
-		t.Errorf("allocated %d bytes, want under the 4 MiB read-ahead plus the largest member (%d, with 1 MiB to spare)", delta, limit)
+	if limit := uint64(4<<20 + member + 256<<10); delta > limit {
+		t.Errorf("the pack check allocated %d bytes, want under the 4 MiB read-ahead plus the largest member (%d, with 256 KiB to spare)", delta, limit)
 	}
 
 	kinds := func(r core.FsckReport) map[string]bool {
