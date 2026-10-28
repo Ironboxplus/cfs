@@ -60,6 +60,8 @@ jobs:
         run: |
           echo "build-cache=$(go env GOCACHE)" >> "$GITHUB_OUTPUT"
           echo "mod-cache=$(go env GOMODCACHE)" >> "$GITHUB_OUTPUT"
+          # actions/cache rejects paths with "..": pass go.mod's ../rclone-fork as an absolute path.
+          echo "rclone-fork=$(cd .. && { pwd -W 2>/dev/null || pwd; })/rclone-fork" >> "$GITHUB_OUTPUT"
       # Downloaded module source is the same for every job: one shared key.
       - name: Module cache
         uses: actions/cache@v6
@@ -83,8 +85,8 @@ jobs:
         id: rclone-cache
         uses: actions/cache@v6
         with:
-          path: ../rclone-fork
-          key: rclone-fork-v1.75.2-${{ hashFiles('ci/rclone-patches/*.patch', 'ci/setup-rclone.sh') }}
+          path: ${{ steps.go-paths.outputs.rclone-fork }}
+          key: rclone-fork-${{ runner.os }}-v1.75.2-${{ hashFiles('ci/rclone-patches/*.patch', 'ci/setup-rclone.sh') }}
       - name: rclone fork (v1.75.2 + ci/rclone-patches)
         if: steps.rclone-cache.outputs.cache-hit != 'true'
         run: bash ci/setup-rclone.sh
@@ -135,6 +137,8 @@ jobs:
         run: |
           echo "build-cache=$(go env GOCACHE)" >> "$GITHUB_OUTPUT"
           echo "mod-cache=$(go env GOMODCACHE)" >> "$GITHUB_OUTPUT"
+          # actions/cache rejects paths with "..": pass go.mod's ../rclone-fork as an absolute path.
+          echo "rclone-fork=$(cd .. && { pwd -W 2>/dev/null || pwd; })/rclone-fork" >> "$GITHUB_OUTPUT"
       # Downloaded module source is the same for every job: one shared key.
       - name: Module cache
         uses: actions/cache@v6
@@ -158,8 +162,8 @@ jobs:
         id: rclone-cache
         uses: actions/cache@v6
         with:
-          path: ../rclone-fork
-          key: rclone-fork-v1.75.2-${{ hashFiles('ci/rclone-patches/*.patch', 'ci/setup-rclone.sh') }}
+          path: ${{ steps.go-paths.outputs.rclone-fork }}
+          key: rclone-fork-${{ runner.os }}-v1.75.2-${{ hashFiles('ci/rclone-patches/*.patch', 'ci/setup-rclone.sh') }}
       - name: rclone fork (v1.75.2 + ci/rclone-patches)
         if: steps.rclone-cache.outputs.cache-hit != 'true'
         run: bash ci/setup-rclone.sh
@@ -215,6 +219,8 @@ jobs:
         run: |
           echo "build-cache=$(go env GOCACHE)" >> "$GITHUB_OUTPUT"
           echo "mod-cache=$(go env GOMODCACHE)" >> "$GITHUB_OUTPUT"
+          # actions/cache rejects paths with "..": pass go.mod's ../rclone-fork as an absolute path.
+          echo "rclone-fork=$(cd .. && { pwd -W 2>/dev/null || pwd; })/rclone-fork" >> "$GITHUB_OUTPUT"
       # Downloaded module source is the same for every job: one shared key.
       - name: Module cache
         uses: actions/cache@v6
@@ -238,8 +244,8 @@ jobs:
         id: rclone-cache
         uses: actions/cache@v6
         with:
-          path: ../rclone-fork
-          key: rclone-fork-v1.75.2-${{ hashFiles('ci/rclone-patches/*.patch', 'ci/setup-rclone.sh') }}
+          path: ${{ steps.go-paths.outputs.rclone-fork }}
+          key: rclone-fork-${{ runner.os }}-v1.75.2-${{ hashFiles('ci/rclone-patches/*.patch', 'ci/setup-rclone.sh') }}
       - name: rclone fork (v1.75.2 + ci/rclone-patches)
         if: steps.rclone-cache.outputs.cache-hit != 'true'
         run: bash ci/setup-rclone.sh
