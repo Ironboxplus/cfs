@@ -31,6 +31,19 @@ import (
 
 func setupVFS(t *testing.T, threshold string) (*vfs.VFS, func(string) []byte, string, func() *vfs.VFS) {
 	t.Helper()
+	return setupVFSOpts(t, threshold, func(opt *vfscommon.Options) {
+		opt.WriteBack = fs.Duration(30 * time.Millisecond)
+		// rclone 1.75 keeps closed cache items open for a grace period; a directory
+		// rename inside it makes the delayed close fail on the moved path (the same
+		// happens with the local backend), so the model test turns it off.
+		opt.HandleCaching = 0
+	})
+}
+
+// setupVFSOpts is setupVFS with the VFS options in the caller's hands (the
+// defaults of rclone otherwise, cache mode full).
+func setupVFSOpts(t *testing.T, threshold string, tune func(*vfscommon.Options)) (*vfs.VFS, func(string) []byte, string, func() *vfs.VFS) {
+	t.Helper()
 	ctx := context.Background()
 	drive, state, cache := t.TempDir(), t.TempDir(), t.TempDir()
 	if os.Getenv("VFS_DEBUG") != "" {
@@ -53,11 +66,7 @@ func setupVFS(t *testing.T, threshold string) (*vfs.VFS, func(string) []byte, st
 	}
 	opt := vfscommon.Opt
 	opt.CacheMode = vfscommon.CacheModeFull
-	opt.WriteBack = fs.Duration(30 * time.Millisecond)
-	// rclone 1.75 keeps closed cache items open for a grace period; a directory
-	// rename inside it makes the delayed close fail on the moved path (the same
-	// happens with the local backend), so the model test turns it off.
-	opt.HandleCaching = 0
+	tune(&opt)
 	opt.CachePollInterval = fs.Duration(time.Hour)
 	cur := vfs.New(ctx, f, &opt)
 	t.Cleanup(func() {
@@ -100,7 +109,7 @@ func TestVFSModel(t *testing.T) {
 }
 
 func vfsModel(t *testing.T, threshold string) {
-	v, direct, _, remount := setupVFS(t, threshold)
+	v, direct, _, _ := setupVFS(t, threshold)
 	vhist = nil
 	ref := vfsRef{t.TempDir()}
 	rng := rand.New(rand.NewPCG(5, 6))
@@ -291,9 +300,6 @@ func vfsModel(t *testing.T, threshold string) {
 			if p == "" || p == to {
 				break
 			}
-			if _, err := os.Stat(ref.abs(to)); err == nil {
-				break // rename over an existing file: rclone's VFS keeps serving the old cached bytes (same with its local backend)
-			}
 			v.WaitForWriters(30 * time.Second)
 			mkdirs(to)
 			if err := v.Rename(p, to); err != nil {
@@ -317,10 +323,6 @@ func vfsModel(t *testing.T, threshold string) {
 				t.Fatalf("step %d: rename dir %s -> %s: %v", step, src, dst, err)
 			}
 			os.Rename(ref.abs(src), ref.abs(dst))
-			// rclone's VFS loses the siblings of the destination from its in-memory
-			// tree when a directory is renamed into a directory (reproduced below
-			// with rclone's own local backend), so remount.
-			v = remount()
 			counts["dirrename"]++
 			vtrace(t, step, "dirrename "+src+" -> "+dst)
 		default: // read back
