@@ -162,6 +162,11 @@ type Options struct {
 var (
 	regMu   sync.Mutex
 	volumes = map[string]*volRef{}
+	// closing counts the volumes whose last reference is being given up right
+	// now: they are out of volumes, so CloseAll waits for them here. Two
+	// goroutines end a process (rclone clears its Fs cache on one, the exit
+	// handler runs on another) and the process must not exit before the close.
+	closing sync.WaitGroup
 )
 
 type volRef struct {
@@ -345,11 +350,16 @@ func releaseRef(ctx context.Context, ref *volRef) error {
 	regMu.Lock()
 	ref.refs--
 	last := ref.refs <= 0
-	if last && ref.key != "" && volumes[ref.key] == ref {
-		delete(volumes, ref.key)
+	closeNow := last && ref.key != ""
+	if closeNow {
+		closing.Add(1)
+		if volumes[ref.key] == ref {
+			delete(volumes, ref.key)
+		}
 	}
 	regMu.Unlock()
-	if last && ref.key != "" {
+	if closeNow {
+		defer closing.Done()
 		return ref.v.Close(ctx)
 	}
 	return ref.v.Flush(ctx)
@@ -660,6 +670,7 @@ func CloseAll(ctx context.Context) error {
 			first = err
 		}
 	}
+	closing.Wait()
 	return first
 }
 
