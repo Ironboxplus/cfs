@@ -80,9 +80,10 @@ jobs:
         env:
           PKGS: ${{ matrix.pkgs }}
           RUN: ${{ matrix.run }}
+          VERBOSE: ${{ startsWith(matrix.name, 'core-read') && '-v' || '' }}  # the read tests log their measurements
         run: |
           set -o pipefail
-          go test -count=1 -timeout 20m -run "$RUN" $PKGS 2>&1 | tee "$RUNNER_TEMP/test.log"
+          go test -count=1 -timeout 20m $VERBOSE -run "$RUN" $PKGS 2>&1 | tee "$RUNNER_TEMP/test.log"
       - name: tail of the log
         if: failure()
         run: tail -c 200000 "$RUNNER_TEMP/test.log" > "$RUNNER_TEMP/test-tail.log" || true
