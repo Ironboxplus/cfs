@@ -20,6 +20,7 @@ import sys
 import threading
 import time
 import urllib.parse
+import urllib.request
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -50,6 +51,65 @@ def human(n):
         if n < 1024 or u == "TiB":
             return f"{n:.0f} {u}" if u == "B" else f"{n:.2f} {u}"
         n /= 1024
+
+
+def pct(sorted_vals, p):
+    """Nearest-rank percentile of an ascending list."""
+    if not sorted_vals:
+        return 0.0
+    i = max(0, min(len(sorted_vals) - 1, int(-(-p * len(sorted_vals) // 100)) - 1))
+    return sorted_vals[i]
+
+
+def read_stats(src):
+    """The cfs stats JSON from a file path or an http(s) URL; None when unreadable."""
+    for _ in range(5):
+        try:
+            if src.startswith(("http://", "https://")):
+                with urllib.request.urlopen(src, timeout=10) as r:
+                    return json.loads(r.read())
+            with open(src, "rb") as f:
+                return json.loads(f.read())
+        except (OSError, ValueError):
+            time.sleep(0.3)  # the file is rewritten every 300 ms; a read can hit a half-written one
+    return None
+
+
+def stats_delta(before, after):
+    calls = {}
+    for k in set(before.get("Calls") or {}) | set(after.get("Calls") or {}):
+        d = (after.get("Calls") or {}).get(k, 0) - (before.get("Calls") or {}).get(k, 0)
+        if d:
+            calls[k] = d
+    return {"calls": dict(sorted(calls.items())), "total": after.get("Total", 0) - before.get("Total", 0),
+            "bytes_read": after.get("BytesRead", 0) - before.get("BytesRead", 0)}
+
+
+def class_of(size):
+    return "big" if size >= LARGE else "small"
+
+
+def class_report(items, wall):
+    """items: [(size, ttfb, total)] of one size class."""
+    n = len(items)
+    nbytes = sum(s for s, _, _ in items)
+    tt = sorted(t for _, t, _ in items)
+    to = sorted(t for _, _, t in items)
+    wall = max(wall, 1e-9)
+    r = {"files": n, "bytes": nbytes, "wall_seconds": wall,
+         "mb_per_s": nbytes / wall / 1e6, "files_per_s": n / wall}
+    for name, v in (("ttfb", tt), ("total", to)):
+        for p in (50, 95, 99):
+            r[f"{name}_p{p}"] = pct(v, p)
+        r[f"{name}_max"] = v[-1] if v else 0.0
+    return r
+
+
+def class_line(name, r):
+    return (f"  {name:5} {r['files']} files, {human(r['bytes'])}, {r['wall_seconds']:.1f}s, "
+            f"{r['mb_per_s']:.1f} MB/s, {r['files_per_s']:.1f} files/s; "
+            f"ttfb p50/p95/p99/max {r['ttfb_p50'] * 1000:.0f}/{r['ttfb_p95'] * 1000:.0f}/{r['ttfb_p99'] * 1000:.0f}/{r['ttfb_max'] * 1000:.0f} ms; "
+            f"total p50/p95/p99/max {r['total_p50'] * 1000:.0f}/{r['total_p95'] * 1000:.0f}/{r['total_p99'] * 1000:.0f}/{r['total_max'] * 1000:.0f} ms")
 
 
 def sha256_file(path):
@@ -164,7 +224,7 @@ class Dav:
             r = c.getresponse()
             if stream is not None and r.status == 200:
                 while True:
-                    b = r.read(CHUNK)
+                    b = r.read1(CHUNK)
                     if not b:
                         break
                     stream(b)
@@ -231,18 +291,28 @@ class Dav:
                 raise DavError(f"MOVE {src} -> {dst}: HTTP {st}")
         self.retrying("MOVE " + src, go, delays=())
 
-    def sum(self, rel):
-        """GET and return (sha256 hex, size); one attempt."""
+    def sum(self, rel, timing=None):
+        """GET and return (sha256 hex, size); one attempt. timing, when given, gets
+        "ttfb" (seconds to the first body byte; the whole time for an empty file)
+        and "total"."""
         h = hashlib.sha256()
         n = [0]
+        t0 = time.perf_counter()
+        first = [None]
 
         def feed(b):
+            if first[0] is None:
+                first[0] = time.perf_counter() - t0
             h.update(b)
             n[0] += len(b)
         st, _ = self.request("GET", rel, stream=feed)
+        total = time.perf_counter() - t0
         if st != 200:
             self._drop()
             raise DavError(f"GET {rel}: HTTP {st}")
+        if timing is not None:
+            timing["ttfb"] = first[0] if first[0] is not None else total
+            timing["total"] = total
         return h.hexdigest(), n[0]
 
     def list(self, rel):
@@ -450,21 +520,44 @@ def cmd_verify(a):
     targets = [k for k in sorted(m) if k in files]
     if not a.all:
         targets = [k for k in pick_sample(m, a.sample, a.seed) if k in files]
+    if a.klass != "all":
+        targets = [k for k in targets if class_of(m[k]["size"]) == a.klass]
+    if a.order == "random":
+        random.Random(a.seed).shuffle(targets)
     mism, readerr = [], []
     nbytes, ndone = [0], [0]
     lock = threading.Lock()
+    timings = {"small": [], "big": []}  # (size, ttfb, total)
+    spans = {"small": [None, None], "big": [None, None]}  # first start, last end
+    stats_before = None
+    if a.stats:
+        stats_before = read_stats(a.stats)
+        if stats_before is None:
+            log(f"verify: --stats {a.stats!r} is not readable, no call counts")
     t1 = time.time()
 
     def one(rel):
+        tm = {}
+        t_start = time.perf_counter()
+        w_start = time.time()
+        waited = [0.0]
+
         def go():
-            return dav.sum(a.prefix + rel)
+            waited[0] = time.perf_counter() - t_start  # time spent in earlier failed attempts
+            return dav.sum(a.prefix + rel, tm)
         try:
             digest, size = dav.retrying("GET " + rel, go)
         except DavError as e:
             with lock:
                 readerr.append(str(e))
             return
+        w_end = time.time()
         with lock:
+            cl = class_of(m[rel]["size"])
+            timings[cl].append((size, waited[0] + tm["ttfb"], time.perf_counter() - t_start))
+            sp = spans[cl]
+            sp[0] = w_start if sp[0] is None else min(sp[0], w_start)
+            sp[1] = w_end if sp[1] is None else max(sp[1], w_end)
             nbytes[0] += size
             ndone[0] += 1
             if size != m[rel]["size"] or digest != m[rel]["sha256"]:
@@ -474,16 +567,33 @@ def cmd_verify(a):
     with ThreadPoolExecutor(max_workers=a.workers) as pool:
         list(pool.map(one, targets))
     dt = max(time.time() - t1, 1e-9)
+    stats_after = None
+    if stats_before is not None:
+        time.sleep(0.8)  # the stats file is rewritten every 300 ms
+        stats_after = read_stats(a.stats)
     log(f"verify: read {ndone[0]}/{len(targets)} files ({'all' if a.all else 'sample ' + str(len(targets))}), "
         f"{human(nbytes[0])} in {dt:.1f}s ({human(nbytes[0] / dt)}/s); "
         f"{len(mism)} content mismatches, {len(readerr)} read errors")
+    classes = {}
+    for cl in ("small", "big"):
+        if timings[cl]:
+            sp = spans[cl]
+            classes[cl] = class_report(timings[cl], sp[1] - sp[0])
+            log(class_line(cl, classes[cl]))
+    calls = None
+    if stats_before is not None and stats_after is not None:
+        calls = stats_delta(stats_before, stats_after)
+        calls["per_1000_files"] = calls["total"] * 1000.0 / max(ndone[0], 1)
+        log(f"verify: underlying calls during the reads: {calls['total']} ({calls['per_1000_files']:.1f} per 1000 files) "
+            + " ".join(f"{k}={v}" for k, v in calls["calls"].items()) + f"; bytes read {human(calls['bytes_read'])}")
     show_list("content mismatch", sorted(mism))
     show_list("read errors", sorted(readerr))
     bad = len(missing) + len(extra) + len(badsize) + len(mism) + len(readerr)
     log("verify: " + ("OK" if bad == 0 else f"FAILED ({bad} problems)"))
     write_report(a.report, {
         "listed_files": len(files), "listed_dirs": ndirs, "expected": len(m), "read": ndone[0], "bytes": nbytes[0],
-        "read_seconds": dt, "list_seconds": t_list, "missing": missing, "extra": extra, "size_mismatch": badsize,
+        "read_seconds": dt, "list_seconds": t_list, "order": a.order, "class": a.klass,
+        "classes": classes, "stats_delta": calls, "missing": missing, "extra": extra, "size_mismatch": badsize,
         "content_mismatch": sorted(mism), "read_errors": sorted(readerr), "ok": bad == 0})
     return 1 if bad else 0
 
@@ -826,6 +936,10 @@ def main():
     g.add_argument("--sample", type=int)
     g.add_argument("--all", action="store_true")
     s.add_argument("--workers", type=int, default=8)
+    s.add_argument("--order", choices=("sorted", "random"), default="sorted", help="order of the reads (random: seeded shuffle)")
+    s.add_argument("--class", dest="klass", choices=("small", "big", "all"), default="all",
+                   help="only read files of this size class (small: below 8 MiB, packed; big: 8 MiB and up, stored 1:1)")
+    s.add_argument("--stats", help="cfs stats JSON (file path or URL); reports the call-count delta over the read phase")
     s.add_argument("--seed", type=int, default=1)
     s.add_argument("--prefix", default="", help=argparse.SUPPRESS)
     s.set_defaults(fn=cmd_verify)
