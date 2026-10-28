@@ -2,95 +2,65 @@ package core_test
 
 import (
 	"context"
+	"fmt"
 	"io"
-	"strings"
-	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/Ironboxplus/cfs/core"
 	"github.com/Ironboxplus/cfs/internal/testutil"
-	"github.com/Ironboxplus/cfs/store"
 )
 
-// packGate holds the first pack upload until released.
-type packGate struct {
-	store.Store
-	first   atomic.Bool
-	entered chan struct{}
-	release chan struct{}
-}
-
-func (g *packGate) Put(ctx context.Context, p string, src store.Source, o store.PutOpts) error {
-	if strings.HasPrefix(p, core.CtlDir+"/packs/") {
-		if g.first.CompareAndSwap(false, true) { // not sync.Once: it would hold the other packs back too
-			close(g.entered)
-			select {
-			case <-g.release:
-			case <-ctx.Done():
-			}
-		}
-	}
-	return g.Store.Put(ctx, p, src, o)
-}
-
 // Two versions of one name must reach the log, and the index, in the order they
-// were written, however the commits of their packs are scheduled. The older
-// version sits in a pack that is sealed and still uploading; the newer one
-// arrives now. It must not get into a pack of its own that can commit first,
-// or the older version would be applied over it.
+// were written. The commit of a sealed pack reserves its sequence number when
+// its goroutine gets to run, so two packs sealed one after the other can
+// reserve them in either order (the goroutine started last runs first); the
+// index keeps the row with the higher sequence number. A newer version must
+// therefore never get into a pack of its own while a pack with the older one is
+// still in commit.
 func TestStagedNewerVersionNeverCommitsBeforeOlderOne(t *testing.T) {
 	ctx := context.Background()
-	g := &packGate{Store: testutil.LocalStore(t, t.TempDir()), entered: make(chan struct{}), release: make(chan struct{})}
-	st, _ := testutil.Stacked(g, aspectOpts())
+	st, _ := testutil.Stacked(testutil.LocalStore(t, t.TempDir()), aspectOpts())
 	v, err := core.Open(ctx, st, testutil.FastConfig(t.TempDir()))
 	if err != nil {
 		t.Fatal(err)
 	}
-	var released sync.Once
-	releaseGate := func() { released.Do(func() { close(g.release) }) }
 	defer v.Close(ctx)
-	defer releaseGate()
 
-	if _, err := v.PackAdd(ctx, "d/f.txt", []byte("old"), time.Now()); err != nil {
-		t.Fatal(err)
-	}
-	v.SealCur()
-	select {
-	case <-g.entered:
-	case <-time.After(10 * time.Second):
-		t.Fatal("the first pack was never uploaded")
-	}
-	newer := []byte("the newer and longer version")
-	done := make(chan error, 1)
-	go func() {
-		wait, err := v.PackAdd(ctx, "d/f.txt", newer, time.Now().Add(time.Second))
-		if err == nil {
-			err = wait()
+	const n = 300
+	var waits []func() error
+	for i := 0; i < n; i++ {
+		p := fmt.Sprintf("d%d/f.txt", i%7)
+		if _, err := v.PackAdd(ctx, p, []byte("old"), time.Now()); err != nil {
+			t.Fatal(err)
 		}
-		done <- err
-	}()
-	time.Sleep(500 * time.Millisecond) // long enough for a pack of its own to seal and commit
-	releaseGate()
-	select {
-	case err := <-done:
+		v.SealCur() // the older version is on its way to the drive...
+		wait, err := v.PackAdd(ctx, p, []byte(fmt.Sprintf("newer version %d", i)), time.Now().Add(time.Second))
 		if err != nil {
 			t.Fatal(err)
 		}
-	case <-time.After(20 * time.Second):
-		t.Fatal("the newer version never committed")
-	}
-	if err := v.Flush(ctx); err != nil {
-		t.Fatal(err)
-	}
-	rc, err := v.Open(ctx, "d/f.txt", 0, -1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	got, _ := io.ReadAll(rc)
-	rc.Close()
-	if string(got) != string(newer) {
-		t.Fatalf("d/f.txt holds %q, want the newer version %q", got, newer)
+		v.SealCur() // ...when the newer one is packed and sent
+		waits = append(waits, wait)
+		if i%7 == 6 { // one path per directory; settle before a path is used again
+			for _, w := range waits {
+				if err := w(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			waits = nil
+			for j := 0; j < 7; j++ {
+				q := fmt.Sprintf("d%d/f.txt", j)
+				rc, err := v.Open(ctx, q, 0, -1)
+				if err != nil {
+					t.Fatal(err)
+				}
+				got, _ := io.ReadAll(rc)
+				rc.Close()
+				want := fmt.Sprintf("newer version %d", i-6+j)
+				if string(got) != want {
+					t.Fatalf("round %d: %s holds %q, want the newer version %q", i, q, got, want)
+				}
+			}
+		}
 	}
 }
