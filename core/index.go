@@ -10,7 +10,6 @@ import (
 	"unicode/utf8"
 
 	"github.com/Ironboxplus/cfs/metalog"
-	_ "modernc.org/sqlite"
 )
 
 // index is the local SQLite view of the small files kept in packs. It is a

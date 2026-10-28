@@ -10,6 +10,7 @@ import (
 
 	"github.com/Ironboxplus/cfs/aspect"
 	"github.com/Ironboxplus/cfs/core"
+	_ "github.com/Ironboxplus/cfs/sqlitedrv"
 	"github.com/Ironboxplus/cfs/store"
 	"github.com/Ironboxplus/cfs/store/rclonestore"
 	_ "github.com/rclone/rclone/backend/local"

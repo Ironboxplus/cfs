@@ -4,6 +4,7 @@ package main
 
 import (
 	_ "github.com/Ironboxplus/cfs/frontend/rclone"
+	_ "github.com/Ironboxplus/cfs/sqlitedrv"
 	_ "github.com/rclone/rclone/backend/local"
 	_ "github.com/rclone/rclone/backend/webdav"
 	"github.com/rclone/rclone/cmd"

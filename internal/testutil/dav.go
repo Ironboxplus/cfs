@@ -21,6 +21,8 @@ import (
 type DAV struct {
 	Base string
 	HC   *http.Client
+	// User and Pass, when set, are sent as HTTP basic auth.
+	User, Pass string
 }
 
 // NewDAV returns a client for the server at base (no trailing slash).
@@ -49,6 +51,9 @@ func (d *DAV) do(method, p string, body io.Reader, size int64, hdr map[string]st
 	}
 	for k, v := range hdr {
 		req.Header.Set(k, v)
+	}
+	if d.User != "" {
+		req.SetBasicAuth(d.User, d.Pass)
 	}
 	return d.HC.Do(req)
 }

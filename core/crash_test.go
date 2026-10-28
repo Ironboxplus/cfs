@@ -59,6 +59,9 @@ type cwEvent struct {
 
 func readEvents(t *testing.T, file string) []cwEvent {
 	f, err := os.Open(file)
+	if os.IsNotExist(err) {
+		return nil // killed before the writer logged anything: nothing was acknowledged
+	}
 	if err != nil {
 		t.Fatal(err)
 	}
