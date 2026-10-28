@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/Ironboxplus/cfs/aspect"
+	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/lib/atexit"
 )
 
@@ -21,7 +22,9 @@ func registerExit() {
 		atexit.Register(func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 			defer cancel()
-			_ = CloseAll(ctx)
+			fs.Logf(nil, "cfs: exit: closing the volumes")
+			err := CloseAll(ctx)
+			fs.Logf(nil, "cfs: exit: volumes closed: %v", err)
 		})
 	})
 }

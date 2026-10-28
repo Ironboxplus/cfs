@@ -231,6 +231,8 @@ func (v *Volume) Close(ctx context.Context) error {
 			first = err
 		}
 	}
+	v.logf("cfs: closing (read-only %v, fenced %v)", v.ReadOnly(), v.fenced.Load())
+	defer func() { v.logf("cfs: closed: %v", first) }()
 	if !v.ReadOnly() && !v.fenced.Load() {
 		keep(v.Flush(ctx))
 		if v.segsNew.Load() > 0 && v.cfg.CheckpointEvery > 0 {
