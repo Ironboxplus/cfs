@@ -34,3 +34,7 @@ func (v *Volume) SealCur() {
 		v.sealLocked(v.cur)
 	}
 }
+
+// SetMvIntent journals a move without doing it: the state a crash leaves
+// between the journal write and the move on the drive.
+func (v *Volume) SetMvIntent(src, dst string) error { return v.setMvIntent(src, dst) }

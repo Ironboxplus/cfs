@@ -463,9 +463,10 @@ func (v *Volume) finishMove(ctx context.Context, in mvIntent) error {
 		}
 		return v.localOp(metalog.Record{Op: metalog.OpMv, Path: in.Src, To: in.Dst})
 	}
-	if e, ok, err := v.bigAt(ctx, in.Src); err != nil {
+	srcBig, ok, err := v.bigAt(ctx, in.Src)
+	if err != nil {
 		return err
-	} else if !ok || e.IsDir { // gone: it was done
+	} else if !ok || srcBig.IsDir { // gone: it was done
 		return nil
 	}
 	if _, ok, err := v.ix.getCommitted(in.Dst); err != nil {
@@ -486,7 +487,16 @@ func (v *Volume) finishMove(ctx context.Context, in mvIntent) error {
 	if err := v.mkdirAll(ctx, parentOf(in.Dst)); err != nil {
 		return err
 	}
-	return v.st.Move(ctx, in.Src, in.Dst)
+	if err := v.st.Move(ctx, in.Src, in.Dst); err != nil {
+		return err
+	}
+	// The looks above (bigAt) filled the listing cache with both folders as they
+	// were before the move: bring it up to date, as Move does.
+	v.dc.cacheDel(in.Src)
+	ne := srcBig
+	ne.Path = in.Dst
+	v.dc.cacheAdd(ne)
+	return nil
 }
 
 // SetModTime sets the modification time of a file.
