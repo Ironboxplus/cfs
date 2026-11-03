@@ -249,15 +249,26 @@ func (v *Volume) recoverLocal(ctx context.Context) error {
 		if ref, ok := onDrive[key]; ok {
 			seg, err := v.log.ReadSegment(ctx, ref)
 			if err != nil {
+				// Only a segment whose bytes were read and cannot be decoded is
+				// debris. Any other failure (the drive, the network, a cancelled
+				// context) says nothing about the segment: stop here, keep it and
+				// its rows, and the next Open looks again.
+				if !errors.Is(err, metalog.ErrCorrupt) && !isNotFound(err) {
+					return fmt.Errorf("cfs: read log segment %s of an interrupted commit: %w", ref.Name, err)
+				}
 				// Cut short by the crash: it was never complete, so the batch was
 				// never acknowledged. Remove the debris and give the rows back.
 				v.logf("cfs: log segment %s of an interrupted commit is unreadable, discarding it: %v", ref.Name, err)
-				if !v.ReadOnly() {
+				if !v.ReadOnly() && !isNotFound(err) {
 					if derr := v.log.DeleteSegment(ctx, ref); derr != nil {
 						v.logf("cfs: could not remove unreadable log segment %s: %v", ref.Name, derr)
 					}
 				}
 				v.releaseInflight(key)
+				// It is not a segment on the drive any more (or not a whole one):
+				// the rows sealed under it must be uploaded again, not dropped as
+				// "already there" by the loop below.
+				delete(onDrive, key)
 				continue
 			}
 			err = v.ix.tx(func(tx *sql.Tx) error {
@@ -296,11 +307,31 @@ func (v *Volume) recoverLocal(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	checked := map[string]bool{}
 	for _, p := range sealed {
-		if _, ok := onDrive[p.Seg]; ok {
-			if _, err := v.ix.db.Exec("DELETE FROM pending WHERE seg=?", p.Seg); err != nil {
-				return err
+		ref, ok := onDrive[p.Seg]
+		if !ok || checked[p.Seg] {
+			continue
+		}
+		checked[p.Seg] = true
+		// A file of that name is not yet a segment that reached the drive: the
+		// process may have died while it was being written. Only a segment that
+		// reads back whole means its rows are logged.
+		if _, err := v.log.ReadSegment(ctx, ref); err != nil {
+			if !errors.Is(err, metalog.ErrCorrupt) && !isNotFound(err) {
+				// not the segment's fault: keep it and its rows, the next Open retries
+				return fmt.Errorf("cfs: read log segment %s: %w", ref.Name, err)
 			}
+			v.logf("cfs: log segment %s is unreadable, uploading its rows again: %v", ref.Name, err)
+			if !v.ReadOnly() && !isNotFound(err) {
+				if derr := v.log.DeleteSegment(ctx, ref); derr != nil {
+					v.logf("cfs: could not remove unreadable log segment %s: %v", ref.Name, derr)
+				}
+			}
+			continue
+		}
+		if _, err := v.ix.db.Exec("DELETE FROM pending WHERE seg=?", p.Seg); err != nil {
+			return err
 		}
 	}
 	// With the index complete: what was half done on the drive.

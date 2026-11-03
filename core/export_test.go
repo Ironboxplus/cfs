@@ -5,6 +5,8 @@ import (
 	"crypto/sha1"
 	"encoding/hex"
 	"time"
+
+	"github.com/Ironboxplus/cfs/metalog"
 )
 
 // ReadCheckLease and CheckLease expose the commit path's lease checks to the
@@ -42,3 +44,28 @@ func (v *Volume) SetMvIntent(src, dst string) error { return v.setMvIntent(src, 
 // SetStray journals the removal of a large file that a packed file shadows,
 // without doing it: the state a crash leaves after a pack was committed.
 func (v *Volume) SetStray(p string) error { return v.ix.kvSet(strayKey+p, "1") }
+
+// SealMetaInflight seals the queued metadata rows under a new segment number
+// and marks that segment as being committed, as a pack commit does just before
+// it uploads. It returns the file name the segment would have on the drive.
+func (v *Volume) SealMetaInflight() (string, error) {
+	seq, _, err := v.ix.sealPending(v.epoch, true, true)
+	if err != nil || seq == 0 {
+		return "", err
+	}
+	return metalog.SegmentName(v.epoch, seq), nil
+}
+
+// Fence makes Close skip its flush and the release of the lease, as if the
+// process had been killed: what is queued stays queued, the lease stays taken.
+func (v *Volume) Fence() { v.fenced.Store(true) }
+
+// SealMeta is SealMetaInflight for a metadata-only segment: the rows are sealed
+// but no commit is marked as under way.
+func (v *Volume) SealMeta() (string, error) {
+	seq, _, err := v.ix.sealPending(v.epoch, false, true)
+	if err != nil || seq == 0 {
+		return "", err
+	}
+	return metalog.SegmentName(v.epoch, seq), nil
+}

@@ -141,19 +141,19 @@ func (j *Jsonl) ReadSegment(ctx context.Context, ref Ref) (Segment, error) {
 	}
 	zr, err := gzip.NewReader(bytes.NewReader(raw))
 	if err != nil {
-		return Segment{}, fmt.Errorf("metalog: segment %s: %w", ref.Name, err)
+		return Segment{}, corrupt(ref.Name, err)
 	}
 	sc := bufio.NewReaderSize(zr, 1<<20)
 	line, err := sc.ReadBytes('\n')
 	if err != nil {
-		return Segment{}, fmt.Errorf("metalog: segment %s: header: %w", ref.Name, err)
+		return Segment{}, corrupt(ref.Name, fmt.Errorf("header: %w", err))
 	}
 	var h header
 	if err := json.Unmarshal(line, &h); err != nil {
-		return Segment{}, fmt.Errorf("metalog: segment %s: header: %w", ref.Name, err)
+		return Segment{}, corrupt(ref.Name, fmt.Errorf("header: %w", err))
 	}
 	if h.Epoch != ref.Epoch || h.Seq != ref.Seq {
-		return Segment{}, fmt.Errorf("metalog: segment %s claims epoch %d seq %d", ref.Name, h.Epoch, h.Seq)
+		return Segment{}, corrupt(ref.Name, fmt.Errorf("claims epoch %d seq %d", h.Epoch, h.Seq))
 	}
 	seg := Segment{Epoch: h.Epoch, Seq: h.Seq, Pack: h.Pack, PackBytes: h.PB, PackSHA1: h.PS, PackN: h.PN}
 	for {
@@ -161,7 +161,7 @@ func (j *Jsonl) ReadSegment(ctx context.Context, ref Ref) (Segment, error) {
 		if len(line) > 0 {
 			var r Record
 			if jerr := json.Unmarshal(line, &r); jerr != nil {
-				return Segment{}, fmt.Errorf("metalog: segment %s: %w", ref.Name, jerr)
+				return Segment{}, corrupt(ref.Name, jerr)
 			}
 			seg.Records = append(seg.Records, r)
 		}
@@ -169,11 +169,11 @@ func (j *Jsonl) ReadSegment(ctx context.Context, ref Ref) (Segment, error) {
 			break
 		}
 		if err != nil {
-			return Segment{}, fmt.Errorf("metalog: segment %s: %w", ref.Name, err)
+			return Segment{}, corrupt(ref.Name, err)
 		}
 	}
 	if len(seg.Records) != h.N {
-		return Segment{}, fmt.Errorf("metalog: segment %s has %d records, header says %d", ref.Name, len(seg.Records), h.N)
+		return Segment{}, corrupt(ref.Name, fmt.Errorf("has %d records, header says %d", len(seg.Records), h.N))
 	}
 	return seg, nil
 }
@@ -249,4 +249,13 @@ func (j *Jsonl) FetchCheckpoint(ctx context.Context, ref Ref, dstPath string) er
 
 func (j *Jsonl) DeleteCheckpoint(ctx context.Context, ref Ref) error {
 	return j.St.Remove(ctx, j.path(CkptDir, ref.Name))
+}
+
+// ErrCorrupt marks a segment whose bytes were read and cannot be decoded: cut
+// short by a crash, or damaged. A failure to get the bytes (network, rate limit,
+// cancelled context) is not ErrCorrupt, and says nothing about the segment.
+var ErrCorrupt = errors.New("metalog: corrupt segment")
+
+func corrupt(name string, err error) error {
+	return fmt.Errorf("metalog: segment %s: %w: %w", name, ErrCorrupt, err)
 }
