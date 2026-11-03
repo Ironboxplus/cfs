@@ -38,3 +38,7 @@ func (v *Volume) SealCur() {
 // SetMvIntent journals a move without doing it: the state a crash leaves
 // between the journal write and the move on the drive.
 func (v *Volume) SetMvIntent(src, dst string) error { return v.setMvIntent(src, dst) }
+
+// SetStray journals the removal of a large file that a packed file shadows,
+// without doing it: the state a crash leaves after a pack was committed.
+func (v *Volume) SetStray(p string) error { return v.ix.kvSet(strayKey+p, "1") }

@@ -490,6 +490,7 @@ func (v *Volume) finishInterrupted(ctx context.Context) error {
 				if err := v.st.Remove(ctx, p); err != nil && !isNotFound(err) {
 					return fmt.Errorf("cfs: remove shadowed large file %s: %w", p, err)
 				}
+				v.dc.cacheDel(p) // an earlier step of this loop may have cached the folder
 			}
 		case strings.HasPrefix(x.k, putBigKey):
 			// The large upload was never acknowledged (the key goes before the
@@ -502,6 +503,7 @@ func (v *Volume) finishInterrupted(ctx context.Context) error {
 				if err := v.st.Remove(ctx, p); err != nil && !isNotFound(err) {
 					return fmt.Errorf("cfs: remove unacknowledged large file %s: %w", p, err)
 				}
+				v.dc.cacheDel(p)
 			}
 		case strings.HasPrefix(x.k, mvKey):
 			var in mvIntent
