@@ -8,7 +8,7 @@
 ./core            core-fault   1  ^(TestFault.*|TestCancelledPut.*|TestSegmentFailure.*|TestOverwrite.*)$
 ./core            core-big     1  ^(TestBigFile.*|TestThresholdEdges)$
 ./core            core-read    1  ^TestRead.*$
-./core            core-rest    1  ^(TestLazyDirs.*|TestBasic.*|TestMetadataOps|TestSurvives.*|TestTransfers.*|TestListAfter.*|TestExternal.*|TestCorruption.*|TestRemoveAll|TestRebuildFromPacksAlone)$
+./core            core-rest    1  ^(TestLazyDirs.*|TestBasic.*|TestMetadataOps|TestSurvives.*|TestTransfers.*|TestListAfter.*|TestExternal.*|TestCorruption.*|TestRemoveAll|TestRebuildFromPacksAlone|TestFinishedMove.*|TestRecoveryOf.*|TestTorn.*|TestUnreadableSegment.*)$
 ./frontend/rclone fe-fstests   0  ^TestFstests.*$
 ./frontend/rclone fe-vfs       0  ^(TestVFS.*|TestSharedVolume.*)$
 # the OpenList tests skip themselves unless CFS_OP_BIN is set
