@@ -23,6 +23,7 @@ import (
 	"github.com/Ironboxplus/cfs/store"
 	"github.com/Ironboxplus/cfs/store/rclonestore"
 	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/accounting"
 	"github.com/rclone/rclone/fs/cache"
 	"github.com/rclone/rclone/fs/config/configmap"
 	"github.com/rclone/rclone/fs/config/configstruct"
@@ -498,7 +499,7 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 }
 
 func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
-	e, err := f.vol.PutWith(ctx, f.full(src.Remote()), in, f.putOpts(ctx, src))
+	e, err := f.vol.PutWith(ctx, f.full(src.Remote()), in, f.putOpts(ctx, in, src))
 	if err != nil {
 		return nil, mapErr(err)
 	}
@@ -511,7 +512,7 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 // that hashes and uploads by range reads the source itself instead of making a
 // copy of the stream, and the SHA-1 the source knows, so the drive may take the
 // file without a transfer. Small files go into packs and need neither.
-func (f *Fs) putOpts(ctx context.Context, src fs.ObjectInfo) core.PutOpts {
+func (f *Fs) putOpts(ctx context.Context, in io.Reader, src fs.ObjectInfo) core.PutOpts {
 	o := core.PutOpts{Size: src.Size(), MTime: src.ModTime(ctx)}
 	srcObj := fs.UnWrapObjectInfo(src)
 	if srcObj == nil || o.Size < f.vol.Config().Threshold {
@@ -520,14 +521,18 @@ func (f *Fs) putOpts(ctx context.Context, src fs.ObjectInfo) core.PutOpts {
 	if sum, err := src.Hash(ctx, hash.SHA1); err == nil {
 		o.SHA1 = sum
 	}
-	o.Ranged = objectRange{ctx, srcObj}
+	acc, _ := in.(*accounting.Account)
+	o.Ranged = objectRange{ctx, srcObj, acc}
 	return o
 }
 
-// objectRange reads an rclone object by range.
+// objectRange reads an rclone object by range. The bytes are accounted to the
+// transfer's stream (acc, if rclone gave one), so that rclone's statistics and
+// bandwidth limit apply to what is read, as they did when the stream was read.
 type objectRange struct {
 	ctx context.Context
 	o   fs.Object
+	acc *accounting.Account
 }
 
 func (r objectRange) OpenRange(off, n int64) (io.ReadCloser, error) {
@@ -538,7 +543,26 @@ func (r objectRange) OpenRange(off, n int64) (io.ReadCloser, error) {
 	if n > 0 {
 		end = off + n - 1
 	}
-	return r.o.Open(r.ctx, &fs.RangeOption{Start: off, End: end})
+	rc, err := r.o.Open(r.ctx, &fs.RangeOption{Start: off, End: end})
+	if err != nil || r.acc == nil {
+		return rc, err
+	}
+	return &accountedRead{rc, r.acc}, nil
+}
+
+type accountedRead struct {
+	io.ReadCloser
+	acc *accounting.Account
+}
+
+func (a *accountedRead) Read(p []byte) (int, error) {
+	n, err := a.ReadCloser.Read(p)
+	if n > 0 {
+		if accErr := a.acc.AccountRead(n); accErr != nil && err == nil {
+			err = accErr
+		}
+	}
+	return n, err
 }
 
 func (f *Fs) PutStream(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
@@ -676,7 +700,7 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 }
 
 func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
-	e, err := o.fs.vol.PutWith(ctx, o.fs.full(o.remote), in, o.fs.putOpts(ctx, src))
+	e, err := o.fs.vol.PutWith(ctx, o.fs.full(o.remote), in, o.fs.putOpts(ctx, in, src))
 	if err != nil {
 		return mapErr(err)
 	}
