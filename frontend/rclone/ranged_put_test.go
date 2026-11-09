@@ -60,23 +60,6 @@ func (s *probeStats) of(remote string) (out []putCall) {
 	return out
 }
 
-var probes sync.Map // root -> *probeStats
-
-func init() {
-	fs.Register(&fs.RegInfo{
-		Name:        "rangeprobe",
-		Description: "local backend that records how files are put",
-		NewFs: func(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, error) {
-			f, err := fs.NewFs(ctx, root)
-			if err != nil {
-				return nil, err
-			}
-			st, _ := probes.LoadOrStore(root, &probeStats{})
-			return &probeFs{Fs: f, st: st.(*probeStats)}, nil
-		},
-	})
-}
-
 type probeFs struct {
 	fs.Fs
 	st *probeStats
@@ -179,25 +162,37 @@ func setupProbeVFS(t *testing.T) (*vfs.VFS, fs.Fs, *probeStats) {
 	ctx := context.Background()
 	drive, state, cache := t.TempDir(), t.TempDir(), t.TempDir()
 	config.SetCacheDir(cache)
-	f, err := cfsrclone.NewFs(ctx, "probecfs", "", configmap.Simple{
-		"remote": "rangeprobe:" + drive, "state_dir": state, "threshold": "64Ki",
+	local, err := fs.NewFs(ctx, drive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st := &probeStats{}
+	opt, err := cfsrclone.OptionsFrom(configmap.Simple{
+		"state_dir": state, "threshold": "64Ki",
 		"seal_quiet": "10ms", "seal_max": "100ms", "dir_cache": "1h", "lease_ttl": "30s",
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	opt := vfscommon.Opt
-	opt.CacheMode = vfscommon.CacheModeFull
-	opt.WriteBack = fs.Duration(30 * time.Millisecond)
-	opt.HandleCaching = 0
-	opt.CachePollInterval = fs.Duration(time.Hour)
-	v := vfs.New(ctx, f, &opt)
+	sh, err := cfsrclone.Acquire(ctx, "ranged-put-test", func() (fs.Fs, error) { return &probeFs{Fs: local, st: st}, nil }, opt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, err := sh.NewFs(ctx, "probecfs", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	vopt := vfscommon.Opt
+	vopt.CacheMode = vfscommon.CacheModeFull
+	vopt.WriteBack = fs.Duration(30 * time.Millisecond)
+	vopt.HandleCaching = 0
+	vopt.CachePollInterval = fs.Duration(time.Hour)
+	v := vfs.New(ctx, f, &vopt)
 	t.Cleanup(func() {
 		v.Shutdown()
 		cfsrclone.CloseAll(ctx)
 	})
-	st, _ := probes.Load(drive)
-	return v, f, st.(*probeStats)
+	return v, f, st
 }
 
 func vfsWrite(t *testing.T, v *vfs.VFS, name string, data []byte) {
