@@ -130,4 +130,4 @@ require (
 	moul.io/http2curl/v2 v2.3.0 // indirect
 )
 
-replace github.com/rclone/rclone => github.com/Ironboxplus/rclone v0.0.0-20261102231652-26c153dad3e6
+replace github.com/rclone/rclone => github.com/Ironboxplus/rclone v0.0.0-20261109144521-b59dcabf8d75

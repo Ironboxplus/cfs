@@ -498,11 +498,47 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 }
 
 func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
-	e, err := f.vol.Put(ctx, f.full(src.Remote()), in, src.Size(), src.ModTime(ctx))
+	e, err := f.vol.PutWith(ctx, f.full(src.Remote()), in, f.putOpts(ctx, src))
 	if err != nil {
 		return nil, mapErr(err)
 	}
 	return f.newObject(e), nil
+}
+
+// putOpts is what Put and Update tell the volume about src. For a large file
+// that rclone has in a file of its own (the VFS write-back's cache file, any
+// object that can be opened by range) it also hands down that object, so a drive
+// that hashes and uploads by range reads the source itself instead of making a
+// copy of the stream, and the SHA-1 the source knows, so the drive may take the
+// file without a transfer. Small files go into packs and need neither.
+func (f *Fs) putOpts(ctx context.Context, src fs.ObjectInfo) core.PutOpts {
+	o := core.PutOpts{Size: src.Size(), MTime: src.ModTime(ctx)}
+	srcObj := fs.UnWrapObjectInfo(src)
+	if srcObj == nil || o.Size < f.vol.Config().Threshold {
+		return o
+	}
+	if sum, err := src.Hash(ctx, hash.SHA1); err == nil {
+		o.SHA1 = sum
+	}
+	o.Ranged = objectRange{ctx, srcObj}
+	return o
+}
+
+// objectRange reads an rclone object by range.
+type objectRange struct {
+	ctx context.Context
+	o   fs.Object
+}
+
+func (r objectRange) OpenRange(off, n int64) (io.ReadCloser, error) {
+	if n == 0 {
+		return io.NopCloser(strings.NewReader("")), nil
+	}
+	end := int64(-1)
+	if n > 0 {
+		end = off + n - 1
+	}
+	return r.o.Open(r.ctx, &fs.RangeOption{Start: off, End: end})
 }
 
 func (f *Fs) PutStream(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
@@ -640,7 +676,7 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 }
 
 func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
-	e, err := o.fs.vol.Put(ctx, o.fs.full(o.remote), in, src.Size(), src.ModTime(ctx))
+	e, err := o.fs.vol.PutWith(ctx, o.fs.full(o.remote), in, o.fs.putOpts(ctx, src))
 	if err != nil {
 		return mapErr(err)
 	}

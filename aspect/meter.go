@@ -179,6 +179,19 @@ func (c countSource) Open() (io.ReadCloser, error) {
 	return &countReader{rc: rc, n: c.n}, nil
 }
 
+type countRange struct {
+	store.RangeOpener
+	n *atomic.Int64
+}
+
+func (c countRange) OpenRange(off, n int64) (io.ReadCloser, error) {
+	rc, err := c.RangeOpener.OpenRange(off, n)
+	if err != nil {
+		return nil, err
+	}
+	return &countReader{rc: rc, n: c.n}, nil
+}
+
 type countReader struct {
 	rc   io.ReadCloser
 	n    *atomic.Int64
@@ -206,6 +219,9 @@ func (r *countReader) Close() error {
 func (m *Meter) Put(ctx context.Context, p string, src store.Source, o store.PutOpts) error {
 	m.enter("put", Transfer)
 	defer m.leave(Transfer)
+	if o.Ranged != nil {
+		o.Ranged = countRange{o.Ranged, &m.wr}
+	}
 	return m.Store.Put(ctx, p, countSource{src, &m.wr}, o)
 }
 

@@ -94,6 +94,11 @@ type PutOpts struct {
 	// goes to the drive with a large file, which may then take the file without a
 	// transfer (rapid upload). It is not checked here.
 	SHA1 string
+	// Ranged reads the same bytes as the stream by range, if the caller can. A
+	// large file is then handed to the drive as that, and the stream is not read:
+	// a drive that hashes and uploads by range makes no copy of the file. It is
+	// only used when Size is known.
+	Ranged store.RangeOpener
 }
 
 // PutWith is Put with the facts the caller knows about the file.
@@ -160,7 +165,7 @@ func (v *Volume) PutWith(ctx context.Context, p string, r io.Reader, o PutOpts) 
 	if small {
 		return v.putSmall(ctx, p, head, mtime, bigExists)
 	}
-	return v.putLarge(ctx, p, r, size, mtime, o.SHA1)
+	return v.putLarge(ctx, p, r, size, mtime, o.SHA1, o.Ranged)
 }
 
 func (v *Volume) putSmall(ctx context.Context, p string, data []byte, mtime time.Time, stray bool) (Entry, error) {
@@ -200,7 +205,7 @@ func (v *Volume) putSmall(ctx context.Context, p string, data []byte, mtime time
 	return Entry{Path: p, Size: m.size, ModTime: time.Unix(0, m.mtime), Packed: true, SHA1: m.sha1}, nil
 }
 
-func (v *Volume) putLarge(ctx context.Context, p string, r io.Reader, size int64, mtime time.Time, sha1 string) (Entry, error) {
+func (v *Volume) putLarge(ctx context.Context, p string, r io.Reader, size int64, mtime time.Time, sha1 string, ranged store.RangeOpener) (Entry, error) {
 	// A small version of the name that is still staged has to be in the log
 	// before this write removes it (below).
 	if err := v.waitConflicts(ctx, func(q string) bool { return q == p }); err != nil {
@@ -227,7 +232,13 @@ func (v *Volume) putLarge(ctx context.Context, p string, r io.Reader, size int64
 			src = ss // a seekable stream can be uploaded again after a transient failure
 		}
 	}
-	if err := v.st.Put(ctx, p, src, store.PutOpts{Size: size, ModTime: mtime, SHA1: sha1}); err != nil {
+	if size < 0 {
+		ranged = nil
+	}
+	if ranged != nil {
+		src = store.Ranged(ranged) // the stream is left unread, and a retry can read again
+	}
+	if err := v.st.Put(ctx, p, src, store.PutOpts{Size: size, ModTime: mtime, SHA1: sha1, Ranged: ranged}); err != nil {
 		v.dc.cacheDel(p)
 		return Entry{}, err
 	}

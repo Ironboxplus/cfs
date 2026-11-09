@@ -61,10 +61,13 @@ type Source interface {
 type PutOpts struct {
 	Size    int64 // -1 if unknown
 	ModTime time.Time
-	SHA1    string // optional; lets a retry recognise an upload that did land
+	SHA1    string // optional; goes to the drive (rapid upload) and lets a retry recognise an upload that did land
 	// Unique says the name is never reused for different content (packs, log
 	// segments), so an object of the right size is the upload that landed.
 	Unique bool
+	// Ranged, if set, reads the same bytes as the Source by range. The Source
+	// then needs not be read at all.
+	Ranged RangeOpener
 }
 
 // Store is implemented by rclonestore and wrapped by the aspect decorators.
@@ -161,3 +164,45 @@ func (s *seekSource) Open() (io.ReadCloser, error) {
 	return io.NopCloser(s.rs), nil
 }
 func (s *seekSource) Replayable() bool { return true }
+
+// RangeOpener reads a file from any offset (n < 0: to the end). A Put that has
+// one may hash and upload by range, instead of consuming its Source as a single
+// stream, so a drive which needs the content twice (hash first, upload then)
+// doesn't have to copy the whole file somewhere first.
+type RangeOpener interface {
+	OpenRange(off, n int64) (io.ReadCloser, error)
+}
+
+type rangedSource struct{ r RangeOpener }
+
+// Ranged is a replayable Source over a RangeOpener. Open does not touch the
+// file before the first Read: a store that reads by range never reads it.
+func Ranged(r RangeOpener) Source { return rangedSource{r} }
+
+func (s rangedSource) Open() (io.ReadCloser, error) {
+	return &lazyReader{open: func() (io.ReadCloser, error) { return s.r.OpenRange(0, -1) }}, nil
+}
+func (s rangedSource) Replayable() bool { return true }
+
+type lazyReader struct {
+	open func() (io.ReadCloser, error)
+	rc   io.ReadCloser
+	err  error
+}
+
+func (l *lazyReader) Read(p []byte) (int, error) {
+	if l.rc == nil && l.err == nil {
+		l.rc, l.err = l.open()
+	}
+	if l.err != nil {
+		return 0, l.err
+	}
+	return l.rc.Read(p)
+}
+
+func (l *lazyReader) Close() error {
+	if l.rc == nil {
+		return nil
+	}
+	return l.rc.Close()
+}

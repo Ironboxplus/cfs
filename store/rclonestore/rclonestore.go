@@ -208,7 +208,10 @@ func (s *Store) Put(ctx context.Context, p string, src store.Source, o store.Put
 	if o.SHA1 != "" {
 		hashes = map[hash.Type]string{hash.SHA1: o.SHA1}
 	}
-	info := object.NewStaticObjectInfo(p, mt, o.Size, true, hashes, s.f)
+	var info fs.ObjectInfo = object.NewStaticObjectInfo(p, mt, o.Size, true, hashes, s.f)
+	if o.Ranged != nil && o.Size >= 0 {
+		info = &rangeObject{f: s.f, remote: p, size: o.Size, modTime: mt, sha1: o.SHA1, r: o.Ranged}
+	}
 	s.forget(p)
 	var res fs.Object
 	if old, err := s.f.NewObject(ctx, p); err == nil {

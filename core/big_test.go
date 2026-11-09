@@ -11,6 +11,7 @@ import (
 	"math/rand/v2"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -225,3 +226,102 @@ func TestThresholdEdges(t *testing.T) {
 		t.Fatalf("fsck: %v %v", err, rep.Problems)
 	}
 }
+
+// rangedPattern is a RangeOpener over a pattern that counts what is read from it.
+type rangedPattern struct {
+	seed  uint64
+	size  int64
+	opens atomic.Int64
+	bytes atomic.Int64
+}
+
+func (r *rangedPattern) OpenRange(off, n int64) (io.ReadCloser, error) {
+	r.opens.Add(1)
+	end := r.size
+	if n >= 0 {
+		end = min(end, off+n)
+	}
+	return &countedRead{r: &pattern{seed: r.seed, pos: off, size: end}, n: &r.bytes}, nil
+}
+
+type countedRead struct {
+	r *pattern
+	n *atomic.Int64
+}
+
+func (c *countedRead) Read(b []byte) (int, error) {
+	n, err := c.r.Read(b)
+	c.n.Add(int64(n))
+	return n, err
+}
+func (c *countedRead) Close() error { return nil }
+
+type unreadable struct{ t *testing.T }
+
+func (u unreadable) Read([]byte) (int, error) {
+	u.t.Error("the stream was read though the file can be read by range")
+	return 0, io.ErrNoProgress
+}
+
+func testBigFileRanged(t *testing.T, mkStore func(t *testing.T, drive string) store.Store) {
+	drive := t.TempDir()
+	v, _ := bigVolume(t, mkStore(t, drive), 4)
+	ctx := context.Background()
+
+	// A large file the caller can read by range: the stream is never read, and the
+	// drive gets the file once, from the range reader.
+	const size = 1 << 20
+	src := &pattern{seed: 0xBEEF, size: size}
+	rp := &rangedPattern{seed: src.seed, size: size}
+	e, err := v.PutWith(ctx, "big.bin", unreadable{t}, core.PutOpts{Size: size, SHA1: "", Ranged: rp})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e.Packed || e.Size != size {
+		t.Fatalf("entry: %+v", e)
+	}
+	if rp.opens.Load() == 0 || rp.bytes.Load() != size {
+		t.Fatalf("read %d bytes in %d opens from the range reader, want %d", rp.bytes.Load(), rp.opens.Load(), size)
+	}
+	rc, err := v.Open(ctx, "big.bin", 0, -1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, n, err := hashStream(rc)
+	rc.Close()
+	if err != nil || n != size || got != src.sum() {
+		t.Fatalf("read back: n=%d err=%v hash ok=%v", n, err, got == src.sum())
+	}
+
+	// A small file goes into a pack from the stream; the range reader is not used.
+	small := &pattern{seed: 7, size: 10 << 10}
+	unused := &rangedPattern{seed: 7, size: small.size}
+	if _, err := v.PutWith(ctx, "small.bin", &pattern{seed: 7, size: small.size}, core.PutOpts{Size: small.size, Ranged: unused}); err != nil {
+		t.Fatal(err)
+	}
+	if unused.opens.Load() != 0 {
+		t.Fatalf("a small file was read by range")
+	}
+
+	// An unknown length can't use it either.
+	rp2 := &rangedPattern{seed: 9, size: size}
+	if _, err := v.PutWith(ctx, "stream.bin", &pattern{seed: 9, size: size}, core.PutOpts{Size: -1, Ranged: rp2}); err != nil {
+		t.Fatal(err)
+	}
+	if rp2.opens.Load() != 0 {
+		t.Fatalf("a stream of unknown length was read by range")
+	}
+	want := (&pattern{seed: 9, size: size}).sum()
+	rc, err = v.Open(ctx, "stream.bin", 0, -1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, n, err = hashStream(rc)
+	rc.Close()
+	if err != nil || n != size || got != want {
+		t.Fatalf("stream read back: n=%d err=%v hash ok=%v", n, err, got == want)
+	}
+}
+
+func TestBigFileRangedSourceLocal(t *testing.T)  { testBigFileRanged(t, localStoreFn) }
+func TestBigFileRangedSourceWebDAV(t *testing.T) { testBigFileRanged(t, davStoreFn) }
