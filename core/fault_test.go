@@ -340,7 +340,11 @@ func TestSegmentFailureKeepsMetadataOrder(t *testing.T) {
 				return err
 			}
 			v1, v2, yData := randBytes(700), randBytes(900), randBytes(500)
-			go put("keep/x", v1) // durable: blocks until sealed; staged: returns at once
+			putDone := make(chan struct{})
+			go func() { put("keep/x", v1); close(putDone) }() // durable: blocks until sealed; staged: returns at once
+			if mode == core.AckStaged {
+				<-putDone
+			}
 			time.Sleep(100 * time.Millisecond)
 			if err := e.v.Flush(ctx); err != nil {
 				t.Fatal(err)
