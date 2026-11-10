@@ -173,10 +173,11 @@ func TestFaultUploadSucceededButErrored(t *testing.T) {
 		t.Fatal(err)
 	}
 	e.verify(files)
-	// One pack and one log segment per committed batch, however many dropped answers.
+	// One pack per committed batch, however many dropped answers; its segment
+	// may be shared with the packs that came with it.
 	packs := e.packCount()
 	segs, _ := os.ReadDir(filepath.Join(e.drive, ".cfs", "log"))
-	if packs < 1 || len(segs) < packs {
+	if packs < 1 || len(segs) < 1 || len(segs) > packs {
 		t.Errorf("packs=%d segments=%d", packs, len(segs))
 	}
 	var loose []string
