@@ -709,14 +709,24 @@ func (v *Volume) flushMeta(ctx context.Context) error {
 	// What waits for the log goes in the order of the sequence numbers: no
 	// segment of a later commit is written before theirs, and no segment of
 	// several packs reaches over a commit that is not logged yet.
-	if err := v.writeSealedInOrder(ctx); err != nil {
+	if _, err := v.writeSealedInOrder(ctx); err != nil {
 		return err
 	}
 	v.ckptMu.RLock()
 	defer v.ckptMu.RUnlock()
-	seq, rows, err := v.ix.sealPending(v.epoch, false, true)
-	if err != nil || len(rows) == 0 {
+	seq, rows, blocked, err := v.ix.sealPendingIf(v.epoch, false, true, true)
+	if err != nil {
 		return err
+	}
+	if blocked {
+		// A commit is under way, or packs wait behind it: the rows queued now
+		// would get a segment number above theirs, and be written before them.
+		// They ride in the next commit's segment, or go when it is settled.
+		time.AfterFunc(time.Second, v.kickMeta)
+		return nil
+	}
+	if len(rows) == 0 {
+		return nil
 	}
 	return v.uploadMetaSeg(ctx, segKeyOf(v.epoch, seq), rows)
 }

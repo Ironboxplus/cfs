@@ -450,14 +450,33 @@ func (ix *index) allocSeq() (uint64, error) {
 // is also marked as being committed by this process. With onlyIfAny, nothing
 // is reserved when no row is queued (seq 0).
 func (ix *index) sealPending(epoch uint64, inflight, onlyIfAny bool) (seq uint64, rows []pendingRow, err error) {
+	seq, rows, _, err = ix.sealPendingIf(epoch, inflight, onlyIfAny, false)
+	return
+}
+
+// sealPendingIf is sealPending that, with settled, seals nothing while a
+// commit is under way or a segment is waiting to be written (blocked): the
+// number it would take is above theirs, and a segment written under it before
+// theirs would break the order of the log.
+func (ix *index) sealPendingIf(epoch uint64, inflight, onlyIfAny, settled bool) (seq uint64, rows []pendingRow, blocked bool, err error) {
 	err = ix.tx(func(tx *sql.Tx) error {
 		var err error
-		seq, rows = 0, nil
+		seq, rows, blocked = 0, nil, false
 		if rows, err = readPending(tx, "WHERE seg IS NULL"); err != nil {
 			return err
 		}
 		if onlyIfAny && len(rows) == 0 {
 			return nil
+		}
+		if settled {
+			var n int
+			if err := tx.QueryRow("SELECT (SELECT count(*) FROM inflight) + (SELECT count(*) FROM deferred) + (SELECT count(*) FROM pending WHERE seg IS NOT NULL)").Scan(&n); err != nil {
+				return err
+			}
+			if n > 0 {
+				rows, blocked = nil, true
+				return nil
+			}
 		}
 		var s string
 		seq = 1

@@ -109,7 +109,12 @@ type Volume struct {
 	followAt  atomic.Int64       // unix nanos of the last time a reader looked for the writer's news
 	followMu  sync.Mutex
 
-	drainMu    sync.Mutex // one write of the log of deferred packs at a time
+	drainMu sync.Mutex // one write of the log of deferred packs at a time
+
+	// afterBatchUpload is called by the tests between the upload of a batch of
+	// deferred packs and the transaction that records it.
+	afterBatchUpload func()
+
 	defMu      sync.Mutex
 	defMembers int         // members of the deferred packs
 	defTimer   *time.Timer // writes their log when the first has waited LogBatchAge
@@ -239,7 +244,7 @@ func (v *Volume) Flush(ctx context.Context) error {
 	if err := v.flushBatches(ctx); err != nil {
 		return err
 	}
-	if err := v.logDeferred(ctx); err != nil {
+	if _, err := v.writeSealedInOrder(ctx); err != nil {
 		return err
 	}
 	return v.flushMeta(ctx)

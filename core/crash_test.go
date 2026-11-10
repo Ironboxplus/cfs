@@ -407,7 +407,7 @@ func TestCrashPoints(t *testing.T) {
 				points = append(points, "pack_uploaded:1", "log_uploaded:5", "local_marked:1", "meta_fsynced:1")
 			}
 			if mode == core.AckStaged {
-				points = append(points, "staged:90")
+				points = append(points, "staged:90", "log_uploaded:3")
 				if os.Getenv("CFS_LONG") != "" {
 					points = append(points, "staged:1")
 				}

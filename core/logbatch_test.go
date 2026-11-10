@@ -524,3 +524,89 @@ func TestLogBatchSegmentsDoNotReachOverASealedCommit(t *testing.T) {
 		})
 	}
 }
+
+// The process dies after a batch of packs reached the drive and before the
+// local index recorded it, with a metadata segment (the removal of b) and a
+// later pack on its way: the packs are still deferred at the restart. They must
+// not be written again, in the batch of the later pack: their records would
+// replay after the removal and bring b back.
+func TestLogBatchCrashAfterTheBatchBeforeItIsRecorded(t *testing.T) {
+	if os.Getenv("CFS_TEST_ACK") == "durable" {
+		t.Skip("batched logging is the staged mode")
+	}
+	ctx := context.Background()
+	drive, state := t.TempDir(), t.TempDir()
+	open := func(drive, state string) *core.Volume {
+		st, _ := testutil.Stacked(testutil.LocalStore(t, drive), aspectOpts())
+		cfg := testutil.FastConfig(state)
+		cfg.LogBatchAge = time.Hour
+		cfg.SealQuiet, cfg.SealMax = time.Hour, time.Hour
+		cfg.CheckpointEvery = -1
+		v, err := core.Open(ctx, st, cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return v
+	}
+	v := open(drive, state)
+	defer func() { v.Close(ctx) }()
+	add := func(p, data string) {
+		wait, err := v.PackAdd(ctx, p, []byte(data), time.Now())
+		if err != nil {
+			t.Fatal(err)
+		}
+		v.SealCur()
+		if err := wait(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	add("d/base", "the segment before")
+	if err := v.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	add("d/a", "content of a")
+	if err := v.Move(ctx, "d/a", "d/b"); err != nil {
+		t.Fatal(err)
+	}
+	add("d/c", "content of c")
+
+	drive2, state2 := t.TempDir(), t.TempDir()
+	v.OnBatchUploaded(func() {
+		if err := v.Remove(ctx, "d/b"); err != nil {
+			t.Error(err)
+		}
+		if name, err := v.SealMeta(); err != nil || name == "" {
+			t.Errorf("seal: %q %v", name, err)
+		}
+		add("d/d", "content of d")
+		copyDir(t, drive, drive2)
+		copyDir(t, state, state2)
+	})
+	if err := v.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	r := open(drive2, state2)
+	defer r.Close(ctx)
+	if err := r.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	check := func(who string, v *core.Volume) {
+		for p, want := range map[string]bool{"d/a": false, "d/b": false, "d/c": true, "d/d": true} {
+			if _, err := v.Stat(ctx, p); (err == nil) != want {
+				t.Errorf("%s: %s present=%v, want %v (%v)", who, p, err == nil, want, err)
+			}
+		}
+	}
+	check("the restarted volume", r)
+	fresh, _ := openCounting(t, drive2, t.TempDir(), nil)
+	defer fresh.Close(ctx)
+	check("a volume rebuilt from the drive", fresh)
+	rep, err := r.Fsck(ctx, core.FsckOpts{Deep: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range rep.Problems {
+		t.Errorf("fsck: %s", p)
+	}
+}

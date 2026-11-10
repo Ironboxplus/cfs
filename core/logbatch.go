@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -184,6 +185,10 @@ func (v *Volume) logDeferred(ctx context.Context) error {
 		return err
 	}
 	crash.Point("log_uploaded")
+	if f := v.afterBatchUpload; f != nil {
+		v.afterBatchUpload = nil
+		f()
+	}
 	err = v.ix.tx(func(tx *sql.Tx) error {
 		for _, n := range names {
 			if _, err := tx.Exec("DELETE FROM pending WHERE seg=?", n); err != nil {
@@ -219,32 +224,142 @@ func (v *Volume) armDrain() {
 
 // writeSealedInOrder writes what waits for the log in the order of the
 // sequence numbers: the deferred packs below each sealed metadata segment, then
-// that segment, and in the end the packs above the last of them.
-func (v *Volume) writeSealedInOrder(ctx context.Context) error {
-	if err := v.logDeferred(ctx); err != nil {
-		return err
+// that segment, and in the end the packs above the last of them. It stops at a
+// commit that is under way: nothing above that commit's number is written
+// before its own segment, because a segment written now and the segment of a
+// batch named above it later (with the packs below it inside) would replay in
+// the wrong order. blocked is true when something is still waiting then.
+func (v *Volume) writeSealedInOrder(ctx context.Context) (blocked bool, err error) {
+	for {
+		if err := v.logDeferred(ctx); err != nil {
+			return false, err
+		}
+		left, err := readPending(v.ix.db, "WHERE seg IS NOT NULL AND seg NOT IN (SELECT name FROM inflight) AND seg NOT IN (SELECT name FROM deferred)")
+		if err != nil {
+			return false, err
+		}
+		var inflightLow, inflightN, deferredN uint64
+		if err := v.ix.db.QueryRow("SELECT count(*) FROM inflight").Scan(&inflightN); err != nil {
+			return false, err
+		}
+		if err := v.ix.db.QueryRow("SELECT count(*) FROM deferred").Scan(&deferredN); err != nil {
+			return false, err
+		}
+		if inflightN > 0 {
+			low, _, err := inflightFloor(v.ix.db)
+			if err != nil {
+				return false, err
+			}
+			inflightLow = low
+		}
+		if len(left) == 0 {
+			return inflightN > 0 || deferredN > 0, nil
+		}
+		var group []pendingRow
+		for _, p := range left {
+			if p.Seg != left[0].Seg {
+				break
+			}
+			group = append(group, p)
+		}
+		if _, seq, ok := parseSegKey(left[0].Seg); ok && inflightN > 0 && inflightLow < seq {
+			return true, nil
+		}
+		if err := v.uploadMetaSeg(ctx, left[0].Seg, group); err != nil {
+			return false, err
+		}
 	}
-	left, err := readPending(v.ix.db, "WHERE seg IS NOT NULL AND seg NOT IN (SELECT name FROM inflight) AND seg NOT IN (SELECT name FROM deferred)")
+}
+
+// inflightFloor is the lowest sequence number of a commit that is under way.
+func inflightFloor(q queryer) (low uint64, ok bool, err error) {
+	rows, err := q.Query("SELECT name FROM inflight")
+	if err != nil {
+		return 0, false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var k string
+		if err := rows.Scan(&k); err != nil {
+			return 0, false, err
+		}
+		if _, seq, valid := parseSegKey(k); valid && (!ok || seq < low) {
+			low, ok = seq, true
+		}
+	}
+	return low, ok, rows.Err()
+}
+
+// dropLoggedDeferred forgets the deferred packs a segment on the drive already
+// carries: a crash between the upload of a batch and the transaction that
+// recorded it leaves them deferred. Written again, they would replay a second
+// time after the segments that came in between.
+func (v *Volume) dropLoggedDeferred(ctx context.Context) error {
+	rows, err := v.ix.db.Query("SELECT name, pack FROM deferred ORDER BY seq")
 	if err != nil {
 		return err
 	}
-	groups := map[string][]pendingRow{}
-	var order []string
-	for _, p := range left {
-		if _, ok := groups[p.Seg]; !ok {
-			order = append(order, p.Seg)
-		}
-		groups[p.Seg] = append(groups[p.Seg], p)
-	}
-	for _, k := range order {
-		if err := v.uploadMetaSeg(ctx, k, groups[k]); err != nil {
+	type def struct{ name, pack string }
+	var all []def
+	for rows.Next() {
+		var d def
+		if err := rows.Scan(&d.name, &d.pack); err != nil {
+			rows.Close()
 			return err
 		}
-		if err := v.logDeferred(ctx); err != nil {
-			return err
+		all = append(all, d)
+	}
+	rows.Close()
+	if len(all) == 0 {
+		return nil
+	}
+	refs, err := v.segRefs(ctx)
+	if err != nil {
+		return err
+	}
+	onDrive := map[string]metalog.Ref{}
+	for _, r := range refs {
+		onDrive[segKeyOf(r.Epoch, r.Seq)] = r
+	}
+	covered := map[string]bool{}
+	for _, d := range all {
+		ref, ok := onDrive[d.name]
+		if !ok {
+			continue
+		}
+		seg, err := v.log.ReadSegment(ctx, ref)
+		if err != nil {
+			if !errors.Is(err, metalog.ErrCorrupt) && !isNotFound(err) {
+				return fmt.Errorf("cfs: read log segment %s of deferred packs: %w", ref.Name, err)
+			}
+			// Cut short by the crash: it is written again.
+			if !isNotFound(err) {
+				v.logf("cfs: log segment %s is unreadable, writing it again: %v", ref.Name, err)
+				if derr := v.log.DeleteSegment(ctx, ref); derr != nil {
+					v.logf("cfs: could not remove unreadable log segment %s: %v", ref.Name, derr)
+				}
+			}
+			continue
+		}
+		covered[seg.Pack] = true
+		for _, x := range seg.Extra {
+			covered[x.Name] = true
 		}
 	}
-	return nil
+	return v.ix.tx(func(tx *sql.Tx) error {
+		for _, d := range all {
+			if !covered[d.pack] {
+				continue
+			}
+			if _, err := tx.Exec("DELETE FROM pending WHERE seg=?", d.name); err != nil {
+				return err
+			}
+			if _, err := tx.Exec("DELETE FROM deferred WHERE name=?", d.name); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }
 
 // recoverDeferred writes the log of packs a crash left deferred: the packs are
@@ -254,6 +369,9 @@ func (v *Volume) writeSealedInOrder(ctx context.Context) error {
 func (v *Volume) recoverDeferred(ctx context.Context) error {
 	if v.ReadOnly() {
 		return nil
+	}
+	if err := v.dropLoggedDeferred(ctx); err != nil {
+		return err
 	}
 	rows, err := v.ix.db.Query("SELECT name, pack, bytes, sha1 FROM deferred ORDER BY seq")
 	if err != nil {
@@ -290,7 +408,8 @@ func (v *Volume) recoverDeferred(ctx context.Context) error {
 		}
 	}
 	v.logf("cfs: writing the log of %d packs that were uploaded before the crash", len(all))
-	return v.writeSealedInOrder(ctx)
+	_, err = v.writeSealedInOrder(ctx)
+	return err
 }
 
 // segLogged counts a segment written to the drive, and starts a checkpoint when

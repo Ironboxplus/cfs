@@ -75,3 +75,7 @@ func (v *Volume) SealMeta() (string, error) {
 	}
 	return metalog.SegmentName(v.epoch, seq), nil
 }
+
+// OnBatchUploaded runs f once, when a batch of deferred packs has been uploaded
+// and not yet recorded locally: the instant a crash in that window stops at.
+func (v *Volume) OnBatchUploaded(f func()) { v.afterBatchUpload = f }
