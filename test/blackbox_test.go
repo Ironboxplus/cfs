@@ -349,13 +349,12 @@ func TestServerOverFaultyDrive(t *testing.T) {
 	s := e.serve(t, func(o *testutil.ServeOpts) { o.Meta = 1 })
 	// The first change takes the writer lease, which needs the drive: make it
 	// before the faults start.
-	if err := s.DAV.PutBytes("warmup.tmp", []byte("x")); err != nil {
+	if err := s.DAV.Mkcol("warmup"); err != nil { // a folder is made at once, a file only when the cache writes it back
 		t.Fatal(err)
 	}
-	if err := s.DAV.Delete("warmup.tmp"); err != nil {
+	if err := s.DAV.Delete("warmup"); err != nil {
 		t.Fatal(err)
 	}
-	s.WaitDrained(t, time.Minute)
 	proxy.Add(testutil.Fault{Match: func(r *http.Request) bool { return r.Method == "PUT" }, Kind: testutil.Status, Code: 429, Count: 4})
 	proxy.Add(testutil.Fault{Match: func(r *http.Request) bool { return r.Method == "PUT" }, Kind: testutil.DropAfter, Count: 2})
 	proxy.Add(testutil.Fault{Match: func(r *http.Request) bool { return r.Method == "PUT" }, Kind: testutil.DropBefore, Count: 2})
