@@ -669,13 +669,11 @@ func (v *Volume) finishInterrupted(ctx context.Context) error {
 }
 
 // loadDirs brings the directory records up to date after opening: directories
-// of the namespace for the files of an index made before they were recorded,
-// and the folders the drive has. The folder record (ddirs) is a cache of the
-// drive: it is not in the log, a checkpoint's copy of it is dropped, and a
-// missing record is rebuilt by walking the drive from the root. Volumes made
-// before directories lived in the index have a real folder for each of them, so
-// they take this walk once; on a new volume it costs one listing per folder
-// that large files made. A read-only volume asks the drive instead (onDrive).
+// of the namespace for the files of an index made before they were recorded.
+// The folders of the drive (ddirs) are not walked: a writer learns them when a
+// change needs them (ddirs.go), and what an earlier tenure of the lease
+// recorded may be out of date, so a writer starts without it. A read-only
+// volume asks the drive instead.
 func (v *Volume) loadDirs(ctx context.Context) error {
 	if err := v.ix.backfillDirs(); err != nil {
 		return err
@@ -683,37 +681,12 @@ func (v *Volume) loadDirs(ctx context.Context) error {
 	if v.ReadOnly() {
 		return nil
 	}
-	if _, ok := v.ix.kvGet("ddirs_complete"); ok {
-		return nil
-	}
+	v.dk.reset()
 	if err := v.ix.tx(func(tx *sql.Tx) error { _, err := tx.Exec("DELETE FROM ddirs"); return err }); err != nil {
 		return err
 	}
-	if err := v.ix.addDDirs(""); err != nil {
-		return err
-	}
 	v.dc.reset()
-	todo := []string{""}
-	n := 0
-	for len(todo) > 0 {
-		dir := todo[len(todo)-1]
-		todo = todo[:len(todo)-1]
-		ents, err := v.listStore(ctx, dir)
-		if isNotFound(err) {
-			continue
-		}
-		if err != nil {
-			return fmt.Errorf("cfs: walk the drive's folders at %q: %w", dir, err)
-		}
-		n++
-		for _, e := range ents {
-			if e.IsDir {
-				todo = append(todo, e.Path)
-			}
-		}
-	}
-	v.logf("cfs: recorded the drive's folders (%d listed)", n)
-	return v.ix.kvSet("ddirs_complete", "1")
+	return nil
 }
 
 // backfillDirs records the directories of the files of an index made before

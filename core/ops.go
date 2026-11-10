@@ -601,7 +601,7 @@ func (v *Volume) DirMove(ctx context.Context, src, dst string) error {
 	rec := metalog.Record{Op: metalog.OpDmv, Path: src, To: dst}
 	// The drive only moves a folder it has: a tree of small files and empty
 	// directories exists in the index alone.
-	onDriveTree, err := v.ix.anyDDirUnder(src)
+	onDriveTree, err := v.dirOnDrive(ctx, src)
 	if err != nil {
 		return err
 	}
@@ -638,6 +638,8 @@ func (v *Volume) DirMove(ctx context.Context, src, dst string) error {
 	if err != nil {
 		return err
 	}
+	v.dk.dropListed(src)
+	v.dk.dropListed(dst)
 	v.dc.dropTree(src)
 	v.dc.dropTree(dst)
 	v.dc.cacheDel(src)
@@ -802,7 +804,11 @@ func (v *Volume) RemoveAll(ctx context.Context, dir string) error {
 			return err
 		}
 	}
-	if v.ix.hasDDir(dir) {
+	onDrive, err := v.dirOnDrive(ctx, dir)
+	if err != nil {
+		return err
+	}
+	if onDrive {
 		err = v.st.Purge(ctx, dir)
 		if errors.Is(err, store.ErrNotSupported) {
 			err = v.purgeStore(ctx, dir)
@@ -813,6 +819,7 @@ func (v *Volume) RemoveAll(ctx context.Context, dir string) error {
 		if err := v.ix.tx(func(tx *sql.Tx) error { return dropDDirs(tx, dir) }); err != nil {
 			return err
 		}
+		v.dk.dropListed(dir)
 	}
 	v.dc.dropTree(dir)
 	v.dc.cacheDel(dir)

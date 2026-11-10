@@ -115,6 +115,8 @@ type Volume struct {
 	// deferred packs and the transaction that records it.
 	afterBatchUpload func()
 
+	dk dirKnow // the folders of the drive this tenure of the lease has listed (ddirs.go)
+
 	defMu      sync.Mutex
 	defMembers int         // members of the deferred packs
 	defTimer   *time.Timer // writes their log when the first has waited LogBatchAge
@@ -579,17 +581,18 @@ func newDirCache(ttl time.Duration) *dirCache {
 	return &dirCache{ttl: ttl, m: map[string]*dirEnt{}, sf: map[string]*dirFlight{}}
 }
 
-// onDrive says whether the drive may have a folder dir. Folders are only made
-// for large files, and the index records every one of them (ddirs); a read-only
-// volume doesn't know what its writer made since it looked, so it asks.
-func (v *Volume) onDrive(dir string) bool { return v.ReadOnly() || v.ix.hasDDir(dir) }
-
-// listStore lists dir on the drive through the cache. A folder that isn't
-// recorded as existing is not asked about: it is absent. The returned map must
-// not be modified.
+// listStore lists dir on the drive through the cache. For the writer a folder
+// that is known (ddirs.go) to be absent is not asked about. The returned map
+// must not be modified.
 func (v *Volume) listStore(ctx context.Context, dir string) (map[string]store.Entry, error) {
-	if !v.onDrive(dir) {
-		return nil, store.ErrNotFound
+	if !v.ReadOnly() {
+		ok, err := v.dirOnDrive(ctx, dir)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			return nil, store.ErrNotFound
+		}
 	}
 	c := v.dc
 	c.mu.Lock()
@@ -597,6 +600,13 @@ func (v *Volume) listStore(ctx context.Context, dir string) (map[string]store.En
 		c.mu.Unlock()
 		if e.absent {
 			return nil, store.ErrNotFound
+		}
+		if !v.ReadOnly() && !v.dk.isListed(dir) {
+			ents := make([]store.Entry, 0, len(e.ents))
+			for _, x := range e.ents {
+				ents = append(ents, x)
+			}
+			v.learnFolders(dir, ents)
 		}
 		return e.ents, nil
 	}
@@ -632,18 +642,11 @@ func (v *Volume) listStore(ctx context.Context, dir string) (map[string]store.En
 		switch {
 		case err == nil:
 			// What the drive lists is there: remember its folders.
-			var subs []string
-			for _, e := range ents {
-				if e.IsDir && !(dir == "" && strings.HasPrefix(e.Name(), ".cfs")) {
-					subs = append(subs, e.Path)
-				}
-			}
-			if err := v.ix.addDDirs(subs...); err != nil {
-				v.logf("cfs: record folders of %q: %v", dir, err)
-			}
+			v.learnFolders(dir, ents)
 		case errors.Is(err, store.ErrNotFound):
 			// The record said the folder exists and it doesn't (a crash between the
 			// removal on the drive and the record): correct the record.
+			v.dk.dropListed(dir)
 			if err := v.ix.tx(func(tx *sql.Tx) error { return dropDDirs(tx, dir) }); err != nil {
 				v.logf("cfs: forget folder %q: %v", dir, err)
 			}
@@ -716,14 +719,20 @@ func (v *Volume) mkdirAll(ctx context.Context, dir string) error {
 			return err
 		}
 	}
-	if err := v.st.Mkdir(ctx, dir); err != nil && !errors.Is(err, store.ErrExists) {
+	err := v.st.Mkdir(ctx, dir)
+	if err != nil && !errors.Is(err, store.ErrExists) {
 		return err
 	}
 	if err := v.ix.addDDirs(dir); err != nil {
 		return err
 	}
 	v.dc.cacheAdd(store.Entry{Path: dir, IsDir: true, ModTime: time.Now()})
-	v.dc.nowExists(dir)
+	if err == nil {
+		v.dk.markListed(dir) // made just now: nothing in it
+		v.dc.nowExists(dir)
+	} else {
+		v.dc.forget(dir) // it was there already, with whatever it holds
+	}
 	return nil
 }
 
@@ -944,6 +953,7 @@ func (v *Volume) Rmdir(ctx context.Context, dir string) error {
 		if err := v.st.Rmdir(ctx, dir); err != nil && !isNotFound(err) {
 			return err
 		}
+		v.dk.dropListed(dir)
 		if err := v.ix.tx(func(tx *sql.Tx) error { return dropDDirs(tx, dir) }); err != nil {
 			return err
 		}
@@ -975,4 +985,11 @@ func (c *dirCache) nowExists(dir string) {
 	if d, ok := c.m[dir]; !ok || d.absent {
 		c.m[dir] = &dirEnt{at: time.Now(), ents: map[string]store.Entry{}}
 	}
+}
+
+// forget drops the cached listing of one folder.
+func (c *dirCache) forget(dir string) {
+	c.mu.Lock()
+	delete(c.m, dir)
+	c.mu.Unlock()
 }

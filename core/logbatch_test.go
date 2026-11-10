@@ -22,6 +22,8 @@ import (
 type opCounter struct {
 	store.Store
 	segReads, ckptReads, lists, packPuts, packReads atomic.Int64
+	// folderLists counts the listings of the drive's folders (not of the control directory), mkdirs the folders made.
+	folderLists, mkdirs atomic.Int64
 }
 
 func (c *opCounter) Open(ctx context.Context, p string, off, n int64) (io.ReadCloser, error) {
@@ -38,7 +40,15 @@ func (c *opCounter) Open(ctx context.Context, p string, off, n int64) (io.ReadCl
 
 func (c *opCounter) List(ctx context.Context, dir string) ([]store.Entry, error) {
 	c.lists.Add(1)
+	if !strings.HasPrefix(dir, core.CtlDir) {
+		c.folderLists.Add(1)
+	}
 	return c.Store.List(ctx, dir)
+}
+
+func (c *opCounter) Mkdir(ctx context.Context, dir string) error {
+	c.mkdirs.Add(1)
+	return c.Store.Mkdir(ctx, dir)
 }
 
 func (c *opCounter) Put(ctx context.Context, p string, src store.Source, o store.PutOpts) error {
