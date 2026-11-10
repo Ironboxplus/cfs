@@ -72,18 +72,24 @@ type leaseFile struct {
 
 func readLeaseFile(t *testing.T, drive string) (leaseFile, bool) {
 	t.Helper()
-	b, err := os.ReadFile(filepath.Join(drive, ".cfs", "lease.json"))
-	if os.IsNotExist(err) {
-		return leaseFile{}, false
+	var last error
+	// The drive replaces the file in place: a read can catch it half written.
+	for i := 0; i < 50; i++ {
+		b, err := os.ReadFile(filepath.Join(drive, ".cfs", "lease.json"))
+		if os.IsNotExist(err) {
+			return leaseFile{}, false
+		}
+		if err == nil {
+			var l leaseFile
+			if err = json.Unmarshal(b, &l); err == nil {
+				return l, true
+			}
+		}
+		last = err
+		time.Sleep(10 * time.Millisecond)
 	}
-	if err != nil {
-		t.Fatal(err)
-	}
-	var l leaseFile
-	if err := json.Unmarshal(b, &l); err != nil {
-		t.Fatalf("lease.json: %v: %s", err, b)
-	}
-	return l, true
+	t.Fatalf("lease.json: %v", last)
+	return leaseFile{}, false
 }
 
 // waitFor polls until cond holds.
