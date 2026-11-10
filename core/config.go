@@ -55,6 +55,11 @@ type Config struct {
 	// StageMaxBytes caps the data waiting in the staging area (AckStaged): Put
 	// blocks, it does not fail, while the area is full. Default 1 GiB.
 	StageMaxBytes int64
+	// ReadOnly opens the volume without ever taking the writer lease: nothing is
+	// written to the drive, the lease file included, so a writer elsewhere (a
+	// backup job) keeps its lease and can go on writing. Every mutation returns
+	// ErrReadOnly. Call Refresh to follow such a writer.
+	ReadOnly bool
 	// StateDir holds the local SQLite index and spool. Required. Losing it is
 	// safe: it is rebuilt from the drive.
 	StateDir string

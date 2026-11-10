@@ -380,7 +380,8 @@ func (v *Volume) maxDriveEpoch(ctx context.Context, l lease, haveLease bool) (ui
 	return m, nil
 }
 
-// takeLease decides between writer and read-only. A live lease of another
+// takeLease decides between writer and read-only. With Config.ReadOnly it is
+// read-only and writes nothing. Otherwise a live lease of another
 // writer means read-only; a stale, released or foreign-but-dead one is taken
 // over with epoch+1. The drive has no compare-and-swap, so this is a best
 // effort: the commit path re-reads the lease before every commit and fences
@@ -396,6 +397,20 @@ func (v *Volume) takeLease(ctx context.Context) error {
 	}
 	if err != nil {
 		return err
+	}
+	if v.cfg.ReadOnly {
+		// Asked for: the lease is read and left alone, and so is the epoch kept
+		// for a later run as a writer.
+		v.readOnly.Store(true)
+		v.epoch = l.Epoch
+		if !ok {
+			var err error
+			if v.epoch, err = v.maxDriveEpoch(ctx, l, false); err != nil {
+				return err
+			}
+		}
+		v.logf("cfs: opening read-only as asked (epoch %d)", v.epoch)
+		return nil
 	}
 	local := v.ix.kvUint("epoch")
 	if ok && l.Writer != v.writerID && !l.Released &&

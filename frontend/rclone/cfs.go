@@ -117,6 +117,11 @@ func init() {
 			Default:  fs.Duration(30 * time.Minute),
 			Advanced: true,
 		}, {
+			Name:     "read_only",
+			Help:     "Open the volume read-only: the writer lease is never taken, so another writer (a backup job, say) can keep writing; uploads, deletes and moves fail.",
+			Default:  false,
+			Advanced: true,
+		}, {
 			Name:     "gc_grace",
 			Help:     "Grace period before unreferenced packs, old log segments and checkpoints are deleted.",
 			Default:  fs.Duration(24 * time.Hour),
@@ -153,6 +158,7 @@ type Options struct {
 	ReadWindow      fs.SizeSuffix `config:"read_window"`
 	DirCache        fs.Duration   `config:"dir_cache"`
 	LeaseTTL        fs.Duration   `config:"lease_ttl"`
+	ReadOnly        bool          `config:"read_only"`
 	GCGrace         fs.Duration   `config:"gc_grace"`
 	CheckpointEvery int           `config:"checkpoint_every"`
 	Retries         int           `config:"retries"`
@@ -252,6 +258,7 @@ func openRef(ctx context.Context, key string, under func() (fs.Fs, error), opt *
 		Pipeline:        opt.Transfers,
 		DirCacheTTL:     time.Duration(opt.DirCache),
 		LeaseTTL:        time.Duration(opt.LeaseTTL),
+		ReadOnly:        opt.ReadOnly,
 		GCGrace:         time.Duration(opt.GCGrace),
 		CheckpointEvery: opt.CheckpointEvery,
 		Logf:            func(f string, a ...any) { fs.Logf(nil, "cfs: "+f, a...) },
