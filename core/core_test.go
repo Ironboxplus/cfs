@@ -55,6 +55,11 @@ func (e *env) open() {
 	if err != nil {
 		e.t.Fatalf("open volume: %v", err)
 	}
+	// The tests of the volume's own work start from a writer; the first change
+	// would take the lease, and some of them count the drive's calls.
+	if err := v.TakeLease(context.Background()); err != nil {
+		e.t.Fatalf("take the lease: %v", err)
+	}
 	e.v, e.meter = v, m
 }
 

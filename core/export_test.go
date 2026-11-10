@@ -20,6 +20,9 @@ func (v *Volume) TakeLease(ctx context.Context) error { return v.becomeWriter(ct
 // PackAdd puts a small file straight into the open pack, the way the staged
 // packer does, and returns a function that waits for its commit.
 func (v *Volume) PackAdd(ctx context.Context, p string, data []byte, mtime time.Time) (func() error, error) {
+	if err := v.becomeWriter(ctx); err != nil {
+		return nil, err
+	}
 	sum := sha1.Sum(data)
 	m := &member{path: p, size: int64(len(data)), mtime: mtime.UnixNano(), sha1: hex.EncodeToString(sum[:])}
 	stored, meth, crc := v.encodeMember(p, data)

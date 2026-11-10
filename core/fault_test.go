@@ -51,6 +51,11 @@ func newFaultEnv(t *testing.T, retries int, tweak ...func(*core.Config)) *faultE
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The first change takes the lease, which needs the drive: let it, before
+	// a test breaks the drive.
+	if err := v.TakeLease(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 	t.Cleanup(func() { v.Close(context.Background()) })
 	return &faultEnv{t: t, drive: drive, proxy: proxy, v: v, meter: m, stateDir: stateDir}
 }
