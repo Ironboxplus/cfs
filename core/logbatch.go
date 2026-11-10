@@ -83,8 +83,8 @@ type deferredRow struct {
 // drive yet and is not a deferred pack either: a commit that is under way, or
 // the sealed metadata rows of a commit that gave up. ok is false when there is
 // none.
-func (v *Volume) unsettledFloor() (low uint64, ok bool, err error) {
-	rows, err := v.ix.db.Query("SELECT name FROM inflight UNION SELECT seg FROM pending WHERE seg IS NOT NULL AND seg NOT IN (SELECT name FROM deferred)")
+func unsettledFloor(q queryer) (low uint64, ok bool, err error) {
+	rows, err := q.Query("SELECT name FROM inflight UNION SELECT seg FROM pending WHERE seg IS NOT NULL AND seg NOT IN (SELECT name FROM deferred)")
 	if err != nil {
 		return 0, false, err
 	}
@@ -116,27 +116,32 @@ func (v *Volume) logDeferred(ctx context.Context) error {
 		v.defTimer = nil
 	}
 	v.defMu.Unlock()
-	// The commits under way are read before the deferred packs: one that
-	// finishes in between is among the packs.
-	floor, bounded, err := v.unsettledFloor()
-	if err != nil {
-		return err
-	}
-	rows, err := v.ix.db.Query("SELECT name, epoch, seq, pack, bytes, sha1, members, recs FROM deferred ORDER BY seq")
-	if err != nil {
-		return err
-	}
+	// The commits under way and the deferred packs are read in one transaction:
+	// a commit that finishes between two reads would be in neither, and a pack
+	// sealed after it could go in without it.
 	var all []deferredRow
-	for rows.Next() {
-		var r deferredRow
-		if err := rows.Scan(&r.name, &r.epoch, &r.seq, &r.pack, &r.bytes, &r.sha1, &r.members, &r.recs); err != nil {
-			rows.Close()
+	var floor uint64
+	var bounded bool
+	err := v.ix.tx(func(tx *sql.Tx) error {
+		var err error
+		if floor, bounded, err = unsettledFloor(tx); err != nil {
 			return err
 		}
-		all = append(all, r)
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
+		rows, err := tx.Query("SELECT name, epoch, seq, pack, bytes, sha1, members, recs FROM deferred ORDER BY seq")
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var r deferredRow
+			if err := rows.Scan(&r.name, &r.epoch, &r.seq, &r.pack, &r.bytes, &r.sha1, &r.members, &r.recs); err != nil {
+				return err
+			}
+			all = append(all, r)
+		}
+		return rows.Err()
+	})
+	if err != nil {
 		return err
 	}
 	if len(all) == 0 {

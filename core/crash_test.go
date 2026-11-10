@@ -422,6 +422,7 @@ func TestCrashPoints(t *testing.T) {
 func crashPoint(t *testing.T, mode core.AckMode, cp string) {
 	base := t.TempDir()
 	drive, state, events := filepath.Join(base, "drive"), filepath.Join(base, "state"), filepath.Join(base, "events")
+	crashDrive = drive
 	os.MkdirAll(drive, 0o755)
 	common := []string{"-remote", drive, "-state", state, "-events", events, "-workers", "4", "-ack", string(mode)}
 	if mode == core.AckStaged {
