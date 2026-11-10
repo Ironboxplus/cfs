@@ -79,7 +79,34 @@ type deferredRow struct {
 	recs       string
 }
 
-// logDeferred writes one segment for every pack waiting for one.
+// unsettledFloor is the lowest sequence number of a segment that is not on the
+// drive yet and is not a deferred pack either: a commit that is under way, or
+// the sealed metadata rows of a commit that gave up. ok is false when there is
+// none.
+func (v *Volume) unsettledFloor() (low uint64, ok bool, err error) {
+	rows, err := v.ix.db.Query("SELECT name FROM inflight UNION SELECT seg FROM pending WHERE seg IS NOT NULL AND seg NOT IN (SELECT name FROM deferred)")
+	if err != nil {
+		return 0, false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var k string
+		if err := rows.Scan(&k); err != nil {
+			return 0, false, err
+		}
+		if _, seq, valid := parseSegKey(k); valid && (!ok || seq < low) {
+			low, ok = seq, true
+		}
+	}
+	return low, ok, rows.Err()
+}
+
+// logDeferred writes one segment for the packs waiting for one. The segment is
+// named after the highest of its commits and replays after every segment with
+// a lower number, so it must not reach over a commit whose own segment is still
+// to come (that commit's records would then replay before the older ones of the
+// packs): only the packs below the lowest such commit go in. The others wait;
+// whoever settles that commit writes them (writeSealedInOrder).
 func (v *Volume) logDeferred(ctx context.Context) error {
 	v.drainMu.Lock()
 	defer v.drainMu.Unlock()
@@ -89,6 +116,12 @@ func (v *Volume) logDeferred(ctx context.Context) error {
 		v.defTimer = nil
 	}
 	v.defMu.Unlock()
+	// The commits under way are read before the deferred packs: one that
+	// finishes in between is among the packs.
+	floor, bounded, err := v.unsettledFloor()
+	if err != nil {
+		return err
+	}
 	rows, err := v.ix.db.Query("SELECT name, epoch, seq, pack, bytes, sha1, members, recs FROM deferred ORDER BY seq")
 	if err != nil {
 		return err
@@ -111,6 +144,17 @@ func (v *Volume) logDeferred(ctx context.Context) error {
 		v.defMembers = 0
 		v.defMu.Unlock()
 		return nil
+	}
+	if bounded {
+		n := 0
+		for n < len(all) && all[n].seq < floor {
+			n++
+		}
+		all = all[:n]
+		if n == 0 {
+			v.armDrain()
+			return nil
+		}
 	}
 	last := all[len(all)-1]
 	seg := metalog.Segment{Epoch: last.epoch, Seq: last.seq, Pack: last.pack, PackBytes: last.bytes, PackSHA1: last.sha1, PackN: last.members}
@@ -159,6 +203,45 @@ func (v *Volume) logDeferred(ctx context.Context) error {
 	return nil
 }
 
+// armDrain makes sure the log of the deferred packs is written later.
+func (v *Volume) armDrain() {
+	v.defMu.Lock()
+	if v.defTimer == nil {
+		v.defTimer = time.AfterFunc(v.cfg.LogBatchAge, v.fireDrain)
+	}
+	v.defMu.Unlock()
+}
+
+// writeSealedInOrder writes what waits for the log in the order of the
+// sequence numbers: the deferred packs below each sealed metadata segment, then
+// that segment, and in the end the packs above the last of them.
+func (v *Volume) writeSealedInOrder(ctx context.Context) error {
+	if err := v.logDeferred(ctx); err != nil {
+		return err
+	}
+	left, err := readPending(v.ix.db, "WHERE seg IS NOT NULL AND seg NOT IN (SELECT name FROM inflight) AND seg NOT IN (SELECT name FROM deferred)")
+	if err != nil {
+		return err
+	}
+	groups := map[string][]pendingRow{}
+	var order []string
+	for _, p := range left {
+		if _, ok := groups[p.Seg]; !ok {
+			order = append(order, p.Seg)
+		}
+		groups[p.Seg] = append(groups[p.Seg], p)
+	}
+	for _, k := range order {
+		if err := v.uploadMetaSeg(ctx, k, groups[k]); err != nil {
+			return err
+		}
+		if err := v.logDeferred(ctx); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // recoverDeferred writes the log of packs a crash left deferred: the packs are
 // checked on the drive (they were verified before the crash, so a missing or
 // changed one is damage), and the segment is written without uploading them
@@ -202,7 +285,7 @@ func (v *Volume) recoverDeferred(ctx context.Context) error {
 		}
 	}
 	v.logf("cfs: writing the log of %d packs that were uploaded before the crash", len(all))
-	return v.logDeferred(ctx)
+	return v.writeSealedInOrder(ctx)
 }
 
 // segLogged counts a segment written to the drive, and starts a checkpoint when

@@ -706,27 +706,11 @@ func (v *Volume) flushMeta(ctx context.Context) error {
 	if queued == 0 {
 		return nil
 	}
-	// The packs waiting for their segment come first, so that no segment of a
-	// later commit is written before theirs; their sealed rows go with them.
-	if err := v.logDeferred(ctx); err != nil {
+	// What waits for the log goes in the order of the sequence numbers: no
+	// segment of a later commit is written before theirs, and no segment of
+	// several packs reaches over a commit that is not logged yet.
+	if err := v.writeSealedInOrder(ctx); err != nil {
 		return err
-	}
-	left, err := readPending(v.ix.db, "WHERE seg IS NOT NULL AND seg NOT IN (SELECT name FROM inflight) AND seg NOT IN (SELECT name FROM deferred)")
-	if err != nil {
-		return err
-	}
-	groups := map[string][]pendingRow{}
-	var order []string
-	for _, p := range left {
-		if _, ok := groups[p.Seg]; !ok {
-			order = append(order, p.Seg)
-		}
-		groups[p.Seg] = append(groups[p.Seg], p)
-	}
-	for _, k := range order {
-		if err := v.uploadMetaSeg(ctx, k, groups[k]); err != nil {
-			return err
-		}
 	}
 	v.ckptMu.RLock()
 	defer v.ckptMu.RUnlock()

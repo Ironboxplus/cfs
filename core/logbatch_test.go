@@ -438,3 +438,89 @@ func TestLogMaintainMakesTheNextOpenCheap(t *testing.T) {
 		t.Errorf("a new volume read %d segments and %d checkpoints, want 0 and 1", oc.segReads.Load(), oc.ckptReads.Load())
 	}
 }
+
+// A segment of several packs is named after the highest of them and replays
+// after every segment with a lower number. Pack A is deferred, then a commit
+// gives up after sealing a metadata row ("move a to b") under its number, then
+// pack C is deferred: the segment of A and C must not be written before the
+// sealed row's own segment, or a rebuild replays "move a to b" before "put a"
+// and ends with a, not b. (This is what the crash test staged:90 found.) With
+// restart set, the process dies in that state and the next start writes it.
+func TestLogBatchSegmentDoesNotReachOverASealedCommit(t *testing.T) {
+	if os.Getenv("CFS_TEST_ACK") == "durable" {
+		t.Skip("batched logging is the staged mode")
+	}
+	for _, restart := range []bool{false, true} {
+		t.Run(fmt.Sprintf("restart=%v", restart), func(t *testing.T) {
+			ctx := context.Background()
+			drive, state := t.TempDir(), t.TempDir()
+			open := func() *core.Volume {
+				st, _ := testutil.Stacked(testutil.LocalStore(t, drive), aspectOpts())
+				cfg := testutil.FastConfig(state)
+				cfg.LogBatchAge = time.Hour
+				cfg.SealQuiet, cfg.SealMax = time.Hour, time.Hour
+				cfg.CheckpointEvery = -1
+				v, err := core.Open(ctx, st, cfg)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return v
+			}
+			v := open()
+			defer func() { v.Close(ctx) }()
+			add := func(p, data string) {
+				wait, err := v.PackAdd(ctx, p, []byte(data), time.Now())
+				if err != nil {
+					t.Fatal(err)
+				}
+				v.SealCur()
+				if err := wait(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			add("d/base", "the segment before")
+			if err := v.Flush(ctx); err != nil {
+				t.Fatal(err)
+			}
+			add("d/a", "content of a")
+			if err := v.Move(ctx, "d/a", "d/b"); err != nil {
+				t.Fatal(err)
+			}
+			if name, err := v.SealMeta(); err != nil || name == "" {
+				t.Fatalf("seal: %q %v", name, err)
+			}
+			add("d/c", "content of c")
+			if n := driveCount(t, drive, "log"); n != 1 {
+				t.Fatalf("%d segments before the flush, the test wants the base one", n)
+			}
+			if restart {
+				v.Fence()
+				if err := v.Close(ctx); err != nil {
+					t.Fatal(err)
+				}
+				v = open()
+			}
+			if err := v.Flush(ctx); err != nil {
+				t.Fatal(err)
+			}
+			check := func(who string, v *core.Volume) {
+				for p, want := range map[string]bool{"d/a": false, "d/b": true, "d/c": true} {
+					if _, err := v.Stat(ctx, p); (err == nil) != want {
+						t.Errorf("%s: %s present=%v, want %v (%v)", who, p, err == nil, want, err)
+					}
+				}
+			}
+			check("the volume", v)
+			fresh, _ := openCounting(t, drive, t.TempDir(), nil)
+			defer fresh.Close(ctx)
+			check("a volume rebuilt from the drive", fresh)
+			rep, err := v.Fsck(ctx, core.FsckOpts{Deep: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, p := range rep.Problems {
+				t.Errorf("fsck: %s", p)
+			}
+		})
+	}
+}

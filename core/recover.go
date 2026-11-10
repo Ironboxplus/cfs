@@ -281,9 +281,6 @@ func (v *Volume) reloadFromCheckpoint(ctx context.Context, cks []metalog.Ref) er
 // recoverLocal finishes what a crash of this process interrupted: a directory
 // move that was only half done, and log segments that were sealed locally.
 func (v *Volume) recoverLocal(ctx context.Context) error {
-	if err := v.recoverDeferred(ctx); err != nil {
-		return err
-	}
 	if s, ok := v.ix.kvGet("dmv_intent"); ok {
 		var rec metalog.Record
 		if err := json.Unmarshal([]byte(s), &rec); err != nil {
@@ -436,6 +433,11 @@ func (v *Volume) recoverLocal(ctx context.Context) error {
 		if _, err := v.ix.db.Exec("DELETE FROM pending WHERE seg=?", p.Seg); err != nil {
 			return err
 		}
+	}
+	// Packs that were uploaded and not logged: once the commits above are
+	// settled, so that their segment does not reach over one of them.
+	if err := v.recoverDeferred(ctx); err != nil {
+		return err
 	}
 	// With the index complete: what was half done on the drive.
 	return v.finishInterrupted(ctx)
