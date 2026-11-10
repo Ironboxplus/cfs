@@ -48,6 +48,9 @@ func TestLeaseReleasedByCloseDespiteAHeartbeatInFlight(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		if err := v.TakeLease(context.Background()); err != nil { // the lease is taken by a change, not by opening
+			t.Fatal(err)
+		}
 		time.Sleep(time.Duration(100+i*13) * time.Millisecond)
 		if err := v.Close(context.Background()); err != nil {
 			t.Fatal(err)
@@ -89,6 +92,9 @@ func TestLeaseSecondCloseWaitsForTheFirst(t *testing.T) {
 	st, _ := testutil.Stacked(pr, aspect.Options{})
 	v, err := core.Open(context.Background(), st, testutil.FastConfig(t.TempDir()))
 	if err != nil {
+		t.Fatal(err)
+	}
+	if err := v.TakeLease(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	first := make(chan error, 1)

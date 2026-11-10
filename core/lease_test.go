@@ -35,12 +35,12 @@ func TestSecondWriterIsReadOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer a.Close(ctx)
-	if a.ReadOnly() || a.Epoch() == 0 {
-		t.Fatalf("first writer: readonly=%v epoch=%d", a.ReadOnly(), a.Epoch())
-	}
 	data := []byte("from the writer")
 	if _, err := a.Put(ctx, "x/a.txt", bytes.NewReader(data), int64(len(data)), time.Now()); err != nil {
 		t.Fatal(err)
+	}
+	if a.ReadOnly() || a.Epoch() == 0 { // the first change took the lease
+		t.Fatalf("first writer: readonly=%v epoch=%d", a.ReadOnly(), a.Epoch())
 	}
 	if err := a.Flush(ctx); err != nil { // a follower sees what is on the drive
 		t.Fatal(err)
@@ -85,8 +85,8 @@ func TestTakeoverAfterCleanCloseAndAfterDeath(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	epochA := a.Epoch()
 	a.Put(ctx, "f.txt", strings.NewReader("one"), 3, time.Now())
+	epochA := a.Epoch()
 	if err := a.Close(ctx); err != nil { // releases the lease
 		t.Fatal(err)
 	}
@@ -94,13 +94,13 @@ func TestTakeoverAfterCleanCloseAndAfterDeath(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if b.ReadOnly() || b.Epoch() != epochA+1 {
-		t.Fatalf("after a clean close the next writer takes over: readonly=%v epoch %d (was %d)", b.ReadOnly(), b.Epoch(), epochA)
-	}
 	if got, _ := readAllVol(b, "f.txt"); string(got) != "one" {
 		t.Fatalf("takeover lost data: %q", got)
 	}
 	b.Put(ctx, "g.txt", strings.NewReader("two"), 3, time.Now())
+	if b.ReadOnly() || b.Epoch() != epochA+1 {
+		t.Fatalf("after a clean close the next writer takes over: readonly=%v epoch %d (was %d)", b.ReadOnly(), b.Epoch(), epochA)
+	}
 	b.Close(ctx)
 
 	// A writer that died without releasing: its lease goes stale and is taken over.
@@ -113,8 +113,8 @@ func TestTakeoverAfterCleanCloseAndAfterDeath(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !c.ReadOnly() {
-		t.Fatal("a fresh lease of a dead writer must still be respected")
+	if _, err := c.Put(ctx, "c.txt", strings.NewReader("no"), 2, time.Now()); !errors.Is(err, core.ErrReadOnly) {
+		t.Fatalf("a fresh lease of a dead writer must still be respected: %v", err)
 	}
 	c.Close(ctx)
 	time.Sleep(3500 * time.Millisecond) // LeaseTTL
@@ -123,14 +123,14 @@ func TestTakeoverAfterCleanCloseAndAfterDeath(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer d.Close(ctx)
+	if _, err := d.Put(ctx, "after.txt", strings.NewReader("ok"), 2, time.Now()); err != nil {
+		t.Fatal(err)
+	}
 	if d.ReadOnly() {
 		t.Fatal("a stale lease must be taken over")
 	}
 	if d.Epoch() <= epochA+1 {
 		t.Fatalf("epoch must increase on takeover: %d", d.Epoch())
-	}
-	if _, err := d.Put(ctx, "after.txt", strings.NewReader("ok"), 2, time.Now()); err != nil {
-		t.Fatal(err)
 	}
 }
 

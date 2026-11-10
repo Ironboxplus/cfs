@@ -171,6 +171,9 @@ func TestSilentWriterIsFencedAfterTakeover(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer b.Close(ctx)
+	if _, err := b.Put(ctx, "b.txt", strings.NewReader("b"), 1, time.Now()); err != nil { // its first change takes the lease over
+		t.Fatal(err)
+	}
 	if b.ReadOnly() || b.Epoch() <= a.Epoch() {
 		t.Fatalf("takeover: readonly=%v epoch %d (silent writer had %d)", b.ReadOnly(), b.Epoch(), a.Epoch())
 	}
@@ -204,6 +207,9 @@ func TestFencedWriterFailsEveryLeaseCheck(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer a.Close(ctx)
+	if err := a.TakeLease(ctx); err != nil {
+		t.Fatal(err)
+	}
 	lc.cut.Store(true)
 	time.Sleep(3500 * time.Millisecond)
 	b, err := openAt(t, drive, t.TempDir(), nil)
@@ -211,6 +217,9 @@ func TestFencedWriterFailsEveryLeaseCheck(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer b.Close(ctx)
+	if err := b.TakeLease(ctx); err != nil {
+		t.Fatal(err)
+	}
 	lc.cut.Store(false)
 	if err := a.ReadCheckLease(ctx); !errors.Is(err, core.ErrFenced) {
 		t.Fatalf("read check after the takeover: %v, want ErrFenced", err)

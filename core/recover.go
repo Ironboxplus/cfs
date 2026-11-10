@@ -341,6 +341,8 @@ func (v *Volume) recoverLocal(ctx context.Context) error {
 // Refresh applies segments written to the drive by the writer since this
 // volume last looked. A read-only volume calls it to follow the writer.
 func (v *Volume) Refresh(ctx context.Context) error {
+	v.catchMu.Lock()
+	defer v.catchMu.Unlock()
 	if !v.ReadOnly() {
 		return nil
 	}

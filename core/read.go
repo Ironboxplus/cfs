@@ -32,6 +32,7 @@ import (
 // What such reads hold in memory is capped by Config.ReadBuffer, and concurrent
 // reads of one member share one download.
 func (v *Volume) Open(ctx context.Context, p string, off, n int64) (io.ReadCloser, error) {
+	v.follow(ctx)
 	p, err := clean(p)
 	if err != nil {
 		return nil, err

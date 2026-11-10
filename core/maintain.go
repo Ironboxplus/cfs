@@ -36,9 +36,11 @@ type CompactReport struct {
 // GC, after a checkpoint and a grace period.
 func (v *Volume) Compact(ctx context.Context, minDead float64) (CompactReport, error) {
 	var rep CompactReport
-	if err := v.writable(); err != nil {
-		return rep, err
+	end, werr := v.beginWrite(ctx)
+	if werr != nil {
+		return rep, werr
 	}
+	defer end()
 	if minDead <= 0 {
 		minDead = 0.5
 	}
@@ -126,9 +128,11 @@ type GCReport struct {
 //     older than the two newest, once older than the grace period.
 func (v *Volume) GC(ctx context.Context) (GCReport, error) {
 	var rep GCReport
-	if err := v.writable(); err != nil {
-		return rep, err
+	end, werr := v.beginWrite(ctx)
+	if werr != nil {
+		return rep, werr
 	}
+	defer end()
 	now := nowUnix()
 	grace := int64(v.cfg.GCGrace / time.Second)
 	graceDur := v.cfg.GCGrace

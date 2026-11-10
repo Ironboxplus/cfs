@@ -46,8 +46,11 @@ type Entry struct {
 func (e Entry) Name() string { _, n := splitPath(e.Path); return n }
 
 // Volume is one cfs volume. It is safe for concurrent use. A volume is
-// single-writer: if another live writer holds the lease, this one is read-only
-// and every mutation returns ErrReadOnly.
+// single-writer, and it is a reader until its first change: opening, listing
+// and reading write nothing to the drive, the lease included. The first change
+// takes the lease, and a writer that has been idle for Config.LeaseIdle hands it
+// back. If another live writer holds the lease, a change returns ErrReadOnly and
+// the volume stays a reader.
 type Volume struct {
 	cfg Config
 	st  store.Store
@@ -98,6 +101,14 @@ type Volume struct {
 	ckptRun atomic.Bool
 	ckptOne sync.Mutex // one Checkpoint at a time
 
+	modeMu    sync.Mutex         // becoming a writer and handing the lease back, one at a time
+	holdMu    sync.RWMutex       // a change holds it shared from start to end; handing back, exclusively
+	catchMu   sync.Mutex         // one catch-up of the index with the drive's log at a time
+	hold      context.CancelFunc // ends the heartbeat and idle loops of the lease held now; leaseMu
+	changedAt atomic.Int64       // unix nanos of the last change, or of taking the lease
+	followAt  atomic.Int64       // unix nanos of the last time a reader looked for the writer's news
+	followMu  sync.Mutex
+	starting  atomic.Bool  // becomeWriter is bringing the index up to date
 	leaseMu   sync.Mutex   // one lease write at a time: the heartbeat and the release
 	leaseDone bool         // the lease has been released: no heartbeat writes it again; leaseMu
 	leaseAt   atomic.Int64 // unix nanos of the last successful read or write of the lease
@@ -108,7 +119,8 @@ func (v *Volume) logf(format string, args ...any) { v.cfg.Logf(format, args...) 
 // Epoch returns this writer's epoch.
 func (v *Volume) Epoch() uint64 { return v.epoch }
 
-// ReadOnly reports whether another writer holds the volume.
+// ReadOnly reports whether this volume is a reader, which holds no lease: it
+// has made no change yet, has handed the lease back, or another writer holds it.
 func (v *Volume) ReadOnly() bool { return v.readOnly.Load() }
 
 // Config returns the effective configuration.
@@ -172,7 +184,10 @@ func Open(ctx context.Context, st store.Store, cfg Config) (*Volume, error) {
 			return fail(err)
 		}
 	}
-	if err := v.takeLease(ctx); err != nil {
+	// A volume with work left from an earlier run (staged files, an unfinished
+	// commit or move) is a writer at once, to finish it; any other starts as a
+	// reader.
+	if err := v.takeLease(ctx, v.hasLocalWork()); err != nil {
 		return fail(err)
 	}
 	if err := v.loadDirs(ctx); err != nil {
@@ -194,10 +209,10 @@ func Open(ctx context.Context, st store.Store, cfg Config) (*Volume, error) {
 		if err := v.st.Mkdir(ctx, ""); err != nil && !errors.Is(err, store.ErrExists) {
 			return fail(fmt.Errorf("cfs: create root: %w", err))
 		}
-		v.wg.Add(1)
-		go v.heartbeatLoop()
+		v.startHold()
 		v.kickMeta()
 	}
+	v.followAt.Store(time.Now().UnixNano())
 	return v, nil
 }
 
@@ -233,6 +248,8 @@ func (v *Volume) Close(ctx context.Context) error {
 
 func (v *Volume) close(ctx context.Context) error {
 	v.closing.Store(true)
+	v.modeMu.Lock() // a change in the middle of taking the lease, or a hand-back, finishes first
+	v.modeMu.Unlock()
 	var first error
 	keep := func(err error) {
 		if err != nil && first == nil {
@@ -380,59 +397,65 @@ func (v *Volume) maxDriveEpoch(ctx context.Context, l lease, haveLease bool) (ui
 	return m, nil
 }
 
-// takeLease decides between writer and read-only. With Config.ReadOnly it is
-// read-only and writes nothing. Otherwise a live lease of another
-// writer means read-only; a stale, released or foreign-but-dead one is taken
-// over with epoch+1. The drive has no compare-and-swap, so this is a best
-// effort: the commit path re-reads the lease before every commit and fences
-// itself when it sees a newer epoch.
-func (v *Volume) takeLease(ctx context.Context) error {
+// readLeaseOrAbsent is readLease, with a lease that stays unreadable counted as
+// absent: nobody can be heartbeating into a file that has stayed unreadable
+// through all the retries.
+func (v *Volume) readLeaseOrAbsent(ctx context.Context) (lease, bool, error) {
 	l, ok, err := v.readLease(ctx)
 	if errors.Is(err, errBadLease) {
-		// Nobody can be heartbeating into a file that has stayed unreadable
-		// through all the retries: treat it as absent. The epoch still comes
-		// from what the drive holds.
 		v.logf("cfs: %v: taking the volume over", err)
-		l, ok, err = lease{}, false, nil
+		return lease{}, false, nil
 	}
+	return l, ok, err
+}
+
+// takeLease is what Open does about the lease. A volume with no work of its own
+// left from an earlier run only looks at it and starts as a reader, writing
+// nothing; one with such work takes the lease (acquire).
+func (v *Volume) takeLease(ctx context.Context, asWriter bool) error {
+	l, ok, err := v.readLeaseOrAbsent(ctx)
 	if err != nil {
 		return err
 	}
-	if v.cfg.ReadOnly {
-		// Asked for: the lease is read and left alone, and so is the epoch kept
-		// for a later run as a writer.
-		v.readOnly.Store(true)
-		v.epoch = l.Epoch
-		if !ok {
-			var err error
-			if v.epoch, err = v.maxDriveEpoch(ctx, l, false); err != nil {
-				return err
-			}
+	if asWriter {
+		held, err := v.acquire(ctx, l, ok)
+		if err != nil || held {
+			return err
 		}
-		v.logf("cfs: opening read-only as asked (epoch %d)", v.epoch)
-		return nil
+		v.logf("cfs: volume held by writer %s (epoch %d), opening as a reader", l.Writer, l.Epoch)
 	}
+	v.readOnly.Store(true)
+	v.epoch = l.Epoch
+	return nil
+}
+
+// acquire takes the lease: a live lease of another writer means no (the volume
+// stays a reader); a stale, released or foreign-but-dead one is taken over with
+// epoch+1. The drive has no compare-and-swap, so this is a best effort: the
+// commit path re-reads the lease before every commit and fences itself when it
+// sees a newer epoch.
+func (v *Volume) acquire(ctx context.Context, l lease, ok bool) (held bool, err error) {
 	local := v.ix.kvUint("epoch")
 	if ok && l.Writer != v.writerID && !l.Released &&
 		time.Since(time.UnixMilli(l.Heartbeat)) < v.cfg.LeaseTTL {
-		v.readOnly.Store(true)
-		v.epoch = l.Epoch
-		v.logf("cfs: volume held by writer %s (epoch %d), opening read-only", l.Writer, l.Epoch)
-		return nil
+		return false, nil
 	}
 	if ok && l.Writer == v.writerID && l.Epoch == local && local != 0 {
 		v.epoch = local
 	} else {
 		drive, err := v.maxDriveEpoch(ctx, l, ok)
 		if err != nil {
-			return err
+			return false, err
 		}
 		v.epoch = max(drive, local) + 1
 		if err := v.ix.kvSet("epoch", strconv.FormatUint(v.epoch, 10)); err != nil {
-			return err
+			return false, err
 		}
 	}
-	return v.writeLease(ctx, false)
+	if err := v.writeLease(ctx, false); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // releaseLease writes the released lease. It waits for a heartbeat that is
@@ -483,13 +506,15 @@ func (v *Volume) readCheckLease(ctx context.Context) error {
 	return nil
 }
 
-func (v *Volume) heartbeatLoop() {
+func (v *Volume) heartbeatLoop(hold context.Context) {
 	defer v.wg.Done()
 	t := time.NewTicker(v.cfg.LeaseTTL / 3)
 	defer t.Stop()
 	for {
 		select {
 		case <-v.ctx.Done():
+			return
+		case <-hold.Done():
 			return
 		case <-t.C:
 		}
@@ -709,6 +734,7 @@ func dirEntry(p string, mtime int64) Entry {
 
 // Stat returns the file or directory at p.
 func (v *Volume) Stat(ctx context.Context, p string) (Entry, error) {
+	v.follow(ctx)
 	p, err := clean(p)
 	if err != nil {
 		return Entry{}, err
@@ -753,6 +779,7 @@ func (v *Volume) Stat(ctx context.Context, p string) (Entry, error) {
 // List returns the children of dir: large files from the drive's listing
 // (only for folders the drive has), small files and directories from the index.
 func (v *Volume) List(ctx context.Context, dir string) ([]Entry, error) {
+	v.follow(ctx)
 	dir, err := clean(dir)
 	if err != nil {
 		return nil, err
@@ -850,9 +877,11 @@ func (v *Volume) Mkdir(ctx context.Context, dir string) error {
 	if reserved(dir) {
 		return ErrReserved
 	}
-	if err := v.writable(); err != nil {
-		return err
+	end, werr := v.beginWrite(ctx)
+	if werr != nil {
+		return werr
 	}
+	defer end()
 	v.structMu.RLock()
 	defer v.structMu.RUnlock()
 	if _, ok, err := v.ix.get(dir); err != nil {
@@ -883,9 +912,11 @@ func (v *Volume) Rmdir(ctx context.Context, dir string) error {
 	if dir == "" || reserved(dir) {
 		return ErrReserved
 	}
-	if err := v.writable(); err != nil {
-		return err
+	end, werr := v.beginWrite(ctx)
+	if werr != nil {
+		return werr
 	}
+	defer end()
 	v.structMu.Lock()
 	defer v.structMu.Unlock()
 	ents, err := v.List(ctx, dir)

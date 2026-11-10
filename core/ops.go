@@ -114,9 +114,11 @@ func (v *Volume) PutWith(ctx context.Context, p string, r io.Reader, o PutOpts) 
 	if reserved(p) {
 		return Entry{}, ErrReserved
 	}
-	if err := v.writable(); err != nil {
-		return Entry{}, err
+	end, werr := v.beginWrite(ctx)
+	if werr != nil {
+		return Entry{}, werr
 	}
+	defer end()
 	if mtime.IsZero() {
 		mtime = time.Now()
 	}
@@ -297,9 +299,11 @@ func (v *Volume) Remove(ctx context.Context, p string) error {
 	if p == "" || reserved(p) {
 		return ErrReserved
 	}
-	if err := v.writable(); err != nil {
-		return err
+	end, werr := v.beginWrite(ctx)
+	if werr != nil {
+		return werr
 	}
+	defer end()
 	if err := v.waitConflicts(ctx, func(q string) bool { return q == p }); err != nil {
 		return err
 	}
@@ -355,9 +359,11 @@ func (v *Volume) Move(ctx context.Context, src, dst string) error {
 	if src == "" || dst == "" || reserved(src) || reserved(dst) {
 		return ErrReserved
 	}
-	if err := v.writable(); err != nil {
-		return err
+	end, werr := v.beginWrite(ctx)
+	if werr != nil {
+		return werr
 	}
+	defer end()
 	if src == dst {
 		if _, err := v.Stat(ctx, src); err != nil {
 			return err
@@ -519,9 +525,11 @@ func (v *Volume) SetModTime(ctx context.Context, p string, t time.Time) error {
 	if p == "" || reserved(p) {
 		return ErrReserved
 	}
-	if err := v.writable(); err != nil {
-		return err
+	end, werr := v.beginWrite(ctx)
+	if werr != nil {
+		return werr
 	}
+	defer end()
 	if err := v.waitConflicts(ctx, func(q string) bool { return q == p }); err != nil {
 		return err
 	}
@@ -558,9 +566,11 @@ func (v *Volume) DirMove(ctx context.Context, src, dst string) error {
 	if src == "" || dst == "" || reserved(src) || reserved(dst) {
 		return ErrReserved
 	}
-	if err := v.writable(); err != nil {
-		return err
+	end, werr := v.beginWrite(ctx)
+	if werr != nil {
+		return werr
 	}
+	defer end()
 	if dst == src {
 		return store.ErrExists
 	}
@@ -681,6 +691,9 @@ func (v *Volume) fireMeta() {
 func (v *Volume) flushMeta(ctx context.Context) error {
 	v.metaFlush.Lock()
 	defer v.metaFlush.Unlock()
+	if v.ReadOnly() { // a reader has handed back everything it wrote
+		return nil
+	}
 	if err := v.writable(); err != nil {
 		return err
 	}
@@ -744,9 +757,11 @@ func (v *Volume) RemoveAll(ctx context.Context, dir string) error {
 	if dir == "" || reserved(dir) {
 		return ErrReserved
 	}
-	if err := v.writable(); err != nil {
-		return err
+	end, werr := v.beginWrite(ctx)
+	if werr != nil {
+		return werr
 	}
+	defer end()
 	v.structMu.Lock()
 	defer v.structMu.Unlock()
 	if err := v.waitConflicts(ctx, func(q string) bool { return q == dir || strings.HasPrefix(q, dir+"/") }); err != nil {

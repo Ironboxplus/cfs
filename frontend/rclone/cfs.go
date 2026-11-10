@@ -117,9 +117,9 @@ func init() {
 			Default:  fs.Duration(30 * time.Minute),
 			Advanced: true,
 		}, {
-			Name:     "read_only",
-			Help:     "Open the volume read-only: the writer lease is never taken, so another writer (a backup job, say) can keep writing; uploads, deletes and moves fail.",
-			Default:  false,
+			Name:     "lease_idle",
+			Help:     "A volume only takes the writer lease for its first change, and gives it back (a released lease) once it has made no change for this long and has nothing left to upload, so that another writer can take over; listing and reading never take it. Negative keeps it until the volume is closed.",
+			Default:  fs.Duration(10 * time.Minute),
 			Advanced: true,
 		}, {
 			Name:     "gc_grace",
@@ -158,7 +158,7 @@ type Options struct {
 	ReadWindow      fs.SizeSuffix `config:"read_window"`
 	DirCache        fs.Duration   `config:"dir_cache"`
 	LeaseTTL        fs.Duration   `config:"lease_ttl"`
-	ReadOnly        bool          `config:"read_only"`
+	LeaseIdle       fs.Duration   `config:"lease_idle"`
 	GCGrace         fs.Duration   `config:"gc_grace"`
 	CheckpointEvery int           `config:"checkpoint_every"`
 	Retries         int           `config:"retries"`
@@ -258,7 +258,7 @@ func openRef(ctx context.Context, key string, under func() (fs.Fs, error), opt *
 		Pipeline:        opt.Transfers,
 		DirCacheTTL:     time.Duration(opt.DirCache),
 		LeaseTTL:        time.Duration(opt.LeaseTTL),
-		ReadOnly:        opt.ReadOnly,
+		LeaseIdle:       time.Duration(opt.LeaseIdle),
 		GCGrace:         time.Duration(opt.GCGrace),
 		CheckpointEvery: opt.CheckpointEvery,
 		Logf:            func(f string, a ...any) { fs.Logf(nil, "cfs: "+f, a...) },

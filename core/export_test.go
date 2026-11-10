@@ -14,6 +14,9 @@ import (
 func (v *Volume) ReadCheckLease(ctx context.Context) error { return v.readCheckLease(ctx) }
 func (v *Volume) CheckLease(ctx context.Context) error     { return v.checkLease(ctx) }
 
+// TakeLease makes this volume the writer now, as its first change would.
+func (v *Volume) TakeLease(ctx context.Context) error { return v.becomeWriter(ctx) }
+
 // PackAdd puts a small file straight into the open pack, the way the staged
 // packer does, and returns a function that waits for its commit.
 func (v *Volume) PackAdd(ctx context.Context, p string, data []byte, mtime time.Time) (func() error, error) {

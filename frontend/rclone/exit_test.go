@@ -90,6 +90,9 @@ func TestSharedVolumeCloseAllWaitsForAShutdownInFlight(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := f.Mkdir(ctx, "d"); err != nil { // the first change takes the lease
+		t.Fatal(err)
+	}
 	slow.Store(true)
 	sh.Release(ctx) // the Fs holds the last reference
 	done := make(chan error, 1)

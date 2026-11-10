@@ -10,7 +10,7 @@ import (
 // Errors returned by Volume. The store sentinels (store.ErrNotFound, ...) are
 // reused where they fit.
 var (
-	ErrReadOnly = errors.New("cfs: volume is read-only (another writer holds the lease)")
+	ErrReadOnly = errors.New("cfs: another writer is writing to the volume (it holds the lease)")
 	ErrFenced   = errors.New("cfs: this writer was fenced off by a newer epoch")
 	ErrReserved = errors.New("cfs: name is reserved")
 	ErrClosed   = errors.New("cfs: volume closed")
@@ -55,11 +55,12 @@ type Config struct {
 	// StageMaxBytes caps the data waiting in the staging area (AckStaged): Put
 	// blocks, it does not fail, while the area is full. Default 1 GiB.
 	StageMaxBytes int64
-	// ReadOnly opens the volume without ever taking the writer lease: nothing is
-	// written to the drive, the lease file included, so a writer elsewhere (a
-	// backup job) keeps its lease and can go on writing. Every mutation returns
-	// ErrReadOnly. Call Refresh to follow such a writer.
-	ReadOnly bool
+	// LeaseIdle: a writer that has made no change for this long, with nothing
+	// left to commit, hands the lease back (a released lease on the drive) and
+	// goes back to being a reader, so that another writer can take over without
+	// waiting for the TTL; the next change takes the lease again. Default 10
+	// minutes; negative keeps the lease until Close.
+	LeaseIdle time.Duration
 	// StateDir holds the local SQLite index and spool. Required. Losing it is
 	// safe: it is rebuilt from the drive.
 	StateDir string
@@ -167,6 +168,9 @@ func (c *Config) fill() error {
 	}
 	if c.LeaseTTL <= 0 {
 		c.LeaseTTL = 30 * time.Minute
+	}
+	if c.LeaseIdle == 0 {
+		c.LeaseIdle = 10 * time.Minute
 	}
 	if c.GCGrace <= 0 {
 		c.GCGrace = 24 * time.Hour
