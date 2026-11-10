@@ -107,6 +107,12 @@ func main() {
 		}()
 	}
 	wg.Wait()
+	// A change that no pack is open to carry: the log of it is a segment of its
+	// own, which the crash point meta_log_uploaded waits for.
+	if err := v.Mkdir(ctx, "zz-final"); err != nil {
+		fmt.Fprintln(os.Stderr, "mkdir:", err)
+		os.Exit(3)
+	}
 	if err := v.Close(ctx); err != nil {
 		fmt.Fprintln(os.Stderr, "close:", err)
 		os.Exit(3)
