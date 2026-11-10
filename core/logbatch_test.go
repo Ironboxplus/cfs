@@ -124,6 +124,12 @@ func TestLogBatchSegmentsDoNotFollowThePacks(t *testing.T) {
 		c.LogBatchAge = time.Hour
 	})
 	defer v.Close(ctx)
+	// One segment is there before the backup (a volume with no log at all
+	// rebuilds from the manifests of the packs instead).
+	putMany(t, v, "base", 1)
+	if err := v.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
 	other, _ := openCounting(t, drive, t.TempDir(), nil)
 	defer other.Close(ctx)
 
@@ -134,8 +140,8 @@ func TestLogBatchSegmentsDoNotFollowThePacks(t *testing.T) {
 	if packs < 300 {
 		t.Fatalf("%d packs, the test wants at least 300", packs)
 	}
-	if segs != 0 {
-		t.Fatalf("%d segments before anything asked for the log", segs)
+	if segs != 1 {
+		t.Fatalf("%d segments before anything asked for the log, want the one before the backup", segs)
 	}
 	checkFiles(t, v, want) // the writer reads its own files meanwhile
 	if err := other.Refresh(ctx); err != nil {
@@ -148,8 +154,8 @@ func TestLogBatchSegmentsDoNotFollowThePacks(t *testing.T) {
 	if err := v.Flush(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if segs = driveCount(t, drive, "log"); segs != 1 {
-		t.Fatalf("%d segments after Flush for %d packs, want 1", segs, packs)
+	if segs = driveCount(t, drive, "log"); segs != 2 {
+		t.Fatalf("%d segments after Flush for %d packs, want 1 more", segs, packs)
 	}
 	if err := other.Refresh(ctx); err != nil {
 		t.Fatal(err)
