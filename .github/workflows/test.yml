@@ -171,7 +171,7 @@ jobs:
         env:
           PKGS: ${{ matrix.pkgs }}
           RUN: ${{ matrix.run }}
-          VERBOSE: ${{ startsWith(matrix.name, 'core-read') && '-v' || '' }}  # the read tests log their measurements
+          VERBOSE: ${{ (startsWith(matrix.name, 'core-read') || startsWith(matrix.name, 'core-log')) && '-v' || '' }}  # the read and log tests log their measurements
         run: |
           set -o pipefail
           go test -count=1 -timeout 20m $VERBOSE -run "$RUN" $PKGS 2>&1 | tee "$RUNNER_TEMP/test.log"
