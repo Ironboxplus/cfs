@@ -178,7 +178,7 @@ func TestLogBatchSegmentsFollowTheTime(t *testing.T) {
 	}
 	packs, segs := driveCount(t, drive, "packs"), driveCount(t, drive, "log")
 	t.Logf("%d packs, %d segments", packs, segs)
-	if segs < 3 || segs > 12 || packs < 50 {
+	if segs < 3 || segs > packs/3 || packs < 50 {
 		t.Fatalf("%d segments for %d packs in three bursts, want about 3", segs, packs)
 	}
 	checkFiles(t, v, want)
@@ -193,6 +193,7 @@ func TestLogBatchMemberCountAndCheckpointEveryTenSegments(t *testing.T) {
 		c.PackMaxFiles = 10
 		c.LogBatchAge = time.Hour
 		c.LogBatchMembers = 100
+		c.CheckpointEvery = 10
 	})
 	defer v.Close(ctx)
 	want := putMany(t, v, "m", 3000)

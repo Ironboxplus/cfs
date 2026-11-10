@@ -524,8 +524,7 @@ func (v *Volume) commitInner(b *batch) (err error) {
 	}
 	crash.Point("local_marked")
 	for _, m := range live {
-		// With batched logging the loose file goes once the log has the packed one.
-		if m.strayBig && !batched {
+		if m.strayBig {
 			if err := v.st.Remove(ctx, m.path); err != nil && !isNotFound(err) {
 				v.logf("cfs: remove shadowed large file %s: %v (will be repeated at the next start)", m.path, err)
 			} else {

@@ -697,6 +697,15 @@ func (v *Volume) flushMeta(ctx context.Context) error {
 	if err := v.writable(); err != nil {
 		return err
 	}
+	// With nothing to write there is nothing to put in order, and the packs
+	// waiting for their segment wait for their time.
+	var queued int
+	if err := v.ix.db.QueryRow("SELECT count(*) FROM pending WHERE seg IS NULL OR (seg NOT IN (SELECT name FROM inflight) AND seg NOT IN (SELECT name FROM deferred))").Scan(&queued); err != nil {
+		return err
+	}
+	if queued == 0 {
+		return nil
+	}
 	// The packs waiting for their segment come first, so that no segment of a
 	// later commit is written before theirs; their sealed rows go with them.
 	if err := v.logDeferred(ctx); err != nil {

@@ -149,7 +149,6 @@ func (v *Volume) logDeferred(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	v.removeStrays(ctx, seg.Records)
 	v.defMu.Lock()
 	v.defMembers = max(0, v.defMembers-members)
 	again := v.defMembers > 0 && v.defTimer == nil
@@ -158,28 +157,6 @@ func (v *Volume) logDeferred(ctx context.Context) error {
 	}
 	v.defMu.Unlock()
 	return nil
-}
-
-// removeStrays removes the large files that packed files of the same name have
-// replaced, now that the log says so.
-func (v *Volume) removeStrays(ctx context.Context, recs []metalog.Record) {
-	for _, r := range recs {
-		if r.Op != metalog.OpPut {
-			continue
-		}
-		if _, ok := v.ix.kvGet(strayKey + r.Path); !ok {
-			continue
-		}
-		if _, ok, err := v.ix.getCommitted(r.Path); err != nil || !ok {
-			continue
-		}
-		if err := v.st.Remove(ctx, r.Path); err != nil && !isNotFound(err) {
-			v.logf("cfs: remove shadowed large file %s: %v (will be repeated at the next start)", r.Path, err)
-			continue
-		}
-		v.ix.db.Exec("DELETE FROM kv WHERE k=?", strayKey+r.Path)
-		v.dc.cacheDel(r.Path)
-	}
 }
 
 // recoverDeferred writes the log of packs a crash left deferred: the packs are
