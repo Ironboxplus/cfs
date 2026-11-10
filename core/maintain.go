@@ -505,6 +505,16 @@ type mismatch struct{ path, detail string }
 // compareWithDrive replays checkpoint + log into a scratch index and compares
 // it with the live one. Only meaningful when no operation is pending.
 func (v *Volume) compareWithDrive(ctx context.Context) ([]mismatch, error) {
+	// No commit goes in while the two are compared, and the packs waiting for
+	// their segment have it written first: the index and the log are then the
+	// same state, whatever else is going on.
+	v.ckptMu.Lock()
+	defer v.ckptMu.Unlock()
+	if !v.ReadOnly() {
+		if err := v.logDeferred(ctx); err != nil {
+			return nil, err
+		}
+	}
 	var pend int
 	if err := v.ix.db.QueryRow("SELECT count(*) FROM pending").Scan(&pend); err != nil {
 		return nil, err
