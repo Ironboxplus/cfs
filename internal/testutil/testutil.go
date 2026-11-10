@@ -40,6 +40,13 @@ func FastConfig(stateDir string) core.Config {
 		SealMax:   400 * time.Millisecond,
 		LeaseTTL:  3 * time.Second,
 		GCGrace:   time.Second,
+		// The tests that are about the log batching and the checkpoint
+		// triggers set their own; the others get what the defaults were before
+		// them: a segment soon after each pack, a checkpoint every 200 segments.
+		LogBatchAge:     20 * time.Millisecond,
+		CheckpointEvery: 200,
+		CheckpointBytes: -1,
+		CleanupSafety:   time.Second,
 	}
 }
 

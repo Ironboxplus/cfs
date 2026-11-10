@@ -360,9 +360,6 @@ func (v *Volume) commit(b *batch) {
 	if err != nil {
 		v.stageFailed(b, err)
 	}
-	if err == nil && v.cfg.CheckpointEvery > 0 && v.segsNew.Add(1) >= int64(v.cfg.CheckpointEvery) {
-		v.maybeCheckpoint()
-	}
 }
 
 func (v *Volume) commitInner(b *batch) (err error) {
@@ -474,11 +471,21 @@ func (v *Volume) commitInner(b *batch) (err error) {
 		puts = append(puts, r)
 	}
 	seg.Records = append(seg.Records, puts...)
-	if err := v.appendSegment(ctx, seg); err != nil {
-		return err
+	batched := v.logBatched()
+	var recsJSON []byte
+	if batched {
+		// The segment waits for the packs that follow (logbatch.go); what it
+		// will carry is kept with the pack, in the transaction that applies it.
+		if recsJSON, err = json.Marshal(seg.Records); err != nil {
+			return err
+		}
+	} else {
+		if err := v.appendSegment(ctx, seg); err != nil {
+			return err
+		}
+		landed = true
+		crash.Point("log_uploaded")
 	}
-	landed = true
-	crash.Point("log_uploaded")
 	err = v.ix.tx(func(tx *sql.Tx) error {
 		for _, r := range puts {
 			if err := applyRecord(tx, r, seq); err != nil {
@@ -497,7 +504,12 @@ func (v *Volume) commitInner(b *batch) (err error) {
 			b.pack, v.epoch, seq, size, packSHA, len(live)); err != nil {
 			return err
 		}
-		if _, err := tx.Exec("DELETE FROM pending WHERE seg=?", segKey); err != nil {
+		if batched {
+			if _, err := tx.Exec("INSERT OR REPLACE INTO deferred(name,epoch,seq,pack,bytes,sha1,members,recs,at) VALUES(?,?,?,?,?,?,?,?,?)",
+				segKey, v.epoch, seq, b.pack, size, packSHA, len(live), string(recsJSON), time.Now().Unix()); err != nil {
+				return err
+			}
+		} else if _, err := tx.Exec("DELETE FROM pending WHERE seg=?", segKey); err != nil {
 			return err
 		}
 		_, err := tx.Exec("DELETE FROM inflight WHERE name=?", segKey)
@@ -506,9 +518,14 @@ func (v *Volume) commitInner(b *batch) (err error) {
 	if err != nil {
 		return err
 	}
+	landed = true
+	if batched {
+		v.noteDeferred(len(live))
+	}
 	crash.Point("local_marked")
 	for _, m := range live {
-		if m.strayBig {
+		// With batched logging the loose file goes once the log has the packed one.
+		if m.strayBig && !batched {
 			if err := v.st.Remove(ctx, m.path); err != nil && !isNotFound(err) {
 				v.logf("cfs: remove shadowed large file %s: %v (will be repeated at the next start)", m.path, err)
 			} else {
@@ -541,7 +558,9 @@ func (v *Volume) appendSegment(ctx context.Context, seg metalog.Segment) error {
 				return err
 			}
 		}
-		if err = v.log.AppendSegment(ctx, seg); err == nil {
+		var size int64
+		if size, err = v.log.AppendSegment(ctx, seg); err == nil {
+			v.segLogged(size)
 			return nil
 		}
 		if ctx.Err() != nil {
@@ -549,6 +568,7 @@ func (v *Volume) appendSegment(ctx context.Context, seg metalog.Segment) error {
 		}
 		if v.segmentLanded(ctx, seg) {
 			v.logf("cfs: log segment %d-%d landed although its upload reported: %v", seg.Epoch, seg.Seq, err)
+			v.segLogged(0)
 			return nil
 		}
 	}

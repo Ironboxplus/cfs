@@ -125,6 +125,7 @@ func TestModel(t *testing.T) {
 		c.SealMax = 100 * time.Millisecond
 		c.GCGrace = 50 * time.Millisecond
 		c.CheckpointEvery = 25
+		c.CleanupSafety = 50 * time.Millisecond
 	})
 	ref := refFS{t.TempDir()}
 	ctx := context.Background()

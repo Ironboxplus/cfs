@@ -32,6 +32,8 @@ type header struct {
 	PB    int64  `json:"pack_bytes,omitempty"`
 	PS    string `json:"pack_sha1,omitempty"`
 	PN    int    `json:"pack_n,omitempty"`
+	// Packs: the other commits of a segment that carries several.
+	Packs []PackFact `json:"packs,omitempty"`
 }
 
 // Jsonl keeps segments as "<epoch>-<seq>.jsonl.gz" (a header line, then one
@@ -57,34 +59,34 @@ func CheckpointName(epoch, seq uint64) string {
 
 func (j *Jsonl) path(dir, name string) string { return j.Ctl + "/" + dir + "/" + name }
 
-func (j *Jsonl) AppendSegment(ctx context.Context, seg Segment) error {
+func (j *Jsonl) AppendSegment(ctx context.Context, seg Segment) (int64, error) {
 	var buf bytes.Buffer
 	zw := gzip.NewWriter(&buf)
 	enc := json.NewEncoder(zw)
-	if err := enc.Encode(header{V: 1, Epoch: seg.Epoch, Seq: seg.Seq, Pack: seg.Pack, N: len(seg.Records), PB: seg.PackBytes, PS: seg.PackSHA1, PN: seg.PackN}); err != nil {
-		return err
+	if err := enc.Encode(header{V: 1, Epoch: seg.Epoch, Seq: seg.Seq, Pack: seg.Pack, N: len(seg.Records), PB: seg.PackBytes, PS: seg.PackSHA1, PN: seg.PackN, Packs: seg.Extra}); err != nil {
+		return 0, err
 	}
 	for i := range seg.Records {
 		if err := enc.Encode(&seg.Records[i]); err != nil {
-			return err
+			return 0, err
 		}
 	}
 	if err := zw.Close(); err != nil {
-		return err
+		return 0, err
 	}
 	data := buf.Bytes()
 	p := j.path(LogDir, SegmentName(seg.Epoch, seg.Seq))
 	if err := j.St.Put(ctx, p, store.Bytes(data), store.PutOpts{Size: int64(len(data)), Unique: true}); err != nil {
-		return fmt.Errorf("metalog: upload segment: %w", err)
+		return 0, fmt.Errorf("metalog: upload segment: %w", err)
 	}
 	e, err := j.St.Stat(ctx, p)
 	if err != nil {
-		return fmt.Errorf("metalog: verify segment: %w", err)
+		return 0, fmt.Errorf("metalog: verify segment: %w", err)
 	}
 	if e.Size != int64(len(data)) {
-		return fmt.Errorf("metalog: segment %s is %d bytes on the drive, wrote %d", p, e.Size, len(data))
+		return 0, fmt.Errorf("metalog: segment %s is %d bytes on the drive, wrote %d", p, e.Size, len(data))
 	}
-	return nil
+	return int64(len(data)), nil
 }
 
 func (j *Jsonl) list(ctx context.Context, dir string, re *regexp.Regexp) ([]Ref, error) {
@@ -155,7 +157,7 @@ func (j *Jsonl) ReadSegment(ctx context.Context, ref Ref) (Segment, error) {
 	if h.Epoch != ref.Epoch || h.Seq != ref.Seq {
 		return Segment{}, corrupt(ref.Name, fmt.Errorf("claims epoch %d seq %d", h.Epoch, h.Seq))
 	}
-	seg := Segment{Epoch: h.Epoch, Seq: h.Seq, Pack: h.Pack, PackBytes: h.PB, PackSHA1: h.PS, PackN: h.PN}
+	seg := Segment{Epoch: h.Epoch, Seq: h.Seq, Pack: h.Pack, PackBytes: h.PB, PackSHA1: h.PS, PackN: h.PN, Extra: h.Packs}
 	for {
 		line, err := sc.ReadBytes('\n')
 		if len(line) > 0 {

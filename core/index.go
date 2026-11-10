@@ -1,6 +1,7 @@
 package core
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -54,6 +55,20 @@ CREATE TABLE IF NOT EXISTS pending(
   at  INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS segs(name TEXT PRIMARY KEY);
+-- deferred: packs that are on the drive and applied to this index, whose log
+-- segment is not written yet (batched logging); recs are the records the
+-- segment will carry, as JSON.
+CREATE TABLE IF NOT EXISTS deferred(
+  name    TEXT PRIMARY KEY,
+  epoch   INTEGER NOT NULL,
+  seq     INTEGER NOT NULL,
+  pack    TEXT NOT NULL,
+  bytes   INTEGER NOT NULL,
+  sha1    TEXT NOT NULL,
+  members INTEGER NOT NULL,
+  recs    TEXT NOT NULL,
+  at      INTEGER NOT NULL DEFAULT 0
+);
 CREATE TABLE IF NOT EXISTS inflight(name TEXT PRIMARY KEY);
 CREATE TABLE IF NOT EXISTS staged(
   path  TEXT PRIMARY KEY,
@@ -103,6 +118,55 @@ func openIndexFile(p string) (*index, error) {
 }
 
 func (ix *index) close() error { return ix.db.Close() }
+
+// loadCheckpointFile makes the index the state of the checkpoint file at path,
+// which covers the log up to seq: the namespace tables are replaced, in one
+// transaction, so that readers of the index see the old state or the new one.
+// Only for an index with no work of its own (a reader).
+func (ix *index) loadCheckpointFile(ctx context.Context, path string, seq uint64) (err error) {
+	conn, err := ix.db.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, "ATTACH DATABASE ? AS ck", path); err != nil {
+		return err
+	}
+	defer conn.ExecContext(context.Background(), "DETACH DATABASE ck")
+	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+		return err
+	}
+	defer func() {
+		if err != nil {
+			conn.ExecContext(context.Background(), "ROLLBACK")
+		}
+	}()
+	for _, q := range []string{
+		"DELETE FROM files",
+		"INSERT INTO files(" + fileCols + ") SELECT " + fileCols + " FROM ck.files",
+		"DELETE FROM packs",
+		"INSERT INTO packs(name,epoch,seq,bytes,sha1,members,dead_at) SELECT name,epoch,seq,bytes,sha1,members,dead_at FROM ck.packs",
+		"DELETE FROM dirs",
+		"INSERT INTO dirs(path,dir,mtime) SELECT path,dir,mtime FROM ck.dirs",
+		"DELETE FROM segs",
+	} {
+		if _, err := conn.ExecContext(ctx, q); err != nil {
+			return err
+		}
+	}
+	s := strconv.FormatUint(seq, 10)
+	n := strconv.FormatUint(seq+1, 10)
+	for _, q := range []string{
+		"INSERT INTO kv(k,v) VALUES('base_seq','" + s + "') ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+		"INSERT INTO kv(k,v) VALUES('next_seq','" + n + "') ON CONFLICT(k) DO UPDATE SET v=CASE WHEN CAST(kv.v AS INTEGER) < " + n + " THEN '" + n + "' ELSE kv.v END",
+	} {
+		if _, err := conn.ExecContext(ctx, q); err != nil {
+			return err
+		}
+	}
+	_, err = conn.ExecContext(ctx, "COMMIT")
+	return err
+}
 
 func (ix *index) tx(f func(*sql.Tx) error) error {
 	tx, err := ix.db.Begin()

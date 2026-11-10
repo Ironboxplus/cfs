@@ -21,7 +21,7 @@ import (
 func (v *Volume) hasLocalWork() bool {
 	var n int
 	err := v.ix.db.QueryRow(`SELECT (SELECT count(*) FROM staged) + (SELECT count(*) FROM pending) +
-		(SELECT count(*) FROM inflight) +
+		(SELECT count(*) FROM inflight) + (SELECT count(*) FROM deferred) +
 		(SELECT count(*) FROM kv WHERE k LIKE 'stray:%' OR k LIKE 'mv:%' OR k LIKE 'putbig:%' OR k = 'dmv_intent')`).Scan(&n)
 	return err != nil || n > 0
 }
@@ -154,7 +154,7 @@ func (v *Volume) idleLoop(hold context.Context) {
 		if time.Since(time.Unix(0, v.changedAt.Load())) < v.cfg.LeaseIdle {
 			continue
 		}
-		if v.handBack() {
+		if v.handBack(false) {
 			return
 		}
 	}
@@ -165,17 +165,29 @@ func (v *Volume) idleLoop(hold context.Context) {
 // reader. It reports whether it did. A change in progress, or one that arrives
 // meanwhile, keeps the lease (the hand-back never waits for a change: it only
 // tries for the lock that changes hold).
-func (v *Volume) handBack() bool {
+func (v *Volume) handBack(force bool) bool {
 	v.modeMu.Lock()
 	defer v.modeMu.Unlock()
 	if v.closing.Load() || v.closed.Load() || v.fenced.Load() || v.readOnly.Load() {
 		return false
 	}
+	idle := func() bool { return force || time.Since(time.Unix(0, v.changedAt.Load())) >= v.cfg.LeaseIdle }
+	// New segments get a checkpoint before the lease goes, so that the next
+	// volume to open reads that and next to nothing of the log. It is made
+	// before the lock that changes wait for is taken: a change that comes
+	// meanwhile keeps the lease.
+	if v.segsNew.Load() > 0 && v.cfg.CheckpointEvery > 0 && idle() {
+		if err := v.Flush(v.ctx); err == nil {
+			if err := v.Checkpoint(v.ctx); err != nil {
+				v.logf("cfs: checkpoint before handing the lease back: %v", err)
+			}
+		}
+	}
 	if !v.holdMu.TryLock() {
 		return false
 	}
 	defer v.holdMu.Unlock()
-	if time.Since(time.Unix(0, v.changedAt.Load())) < v.cfg.LeaseIdle {
+	if !idle() {
 		return false
 	}
 	// Everything acknowledged is on the drive before the lease goes.

@@ -108,10 +108,16 @@ type Volume struct {
 	changedAt atomic.Int64       // unix nanos of the last change, or of taking the lease
 	followAt  atomic.Int64       // unix nanos of the last time a reader looked for the writer's news
 	followMu  sync.Mutex
-	starting  atomic.Bool  // becomeWriter is bringing the index up to date
-	leaseMu   sync.Mutex   // one lease write at a time: the heartbeat and the release
-	leaseDone bool         // the lease has been released: no heartbeat writes it again; leaseMu
-	leaseAt   atomic.Int64 // unix nanos of the last successful read or write of the lease
+
+	drainMu    sync.Mutex // one write of the log of deferred packs at a time
+	defMu      sync.Mutex
+	defMembers int         // members of the deferred packs
+	defTimer   *time.Timer // writes their log when the first has waited LogBatchAge
+	segBytes   atomic.Int64
+	starting   atomic.Bool  // becomeWriter is bringing the index up to date
+	leaseMu    sync.Mutex   // one lease write at a time: the heartbeat and the release
+	leaseDone  bool         // the lease has been released: no heartbeat writes it again; leaseMu
+	leaseAt    atomic.Int64 // unix nanos of the last successful read or write of the lease
 }
 
 func (v *Volume) logf(format string, args ...any) { v.cfg.Logf(format, args...) }
@@ -231,6 +237,9 @@ func (v *Volume) Flush(ctx context.Context) error {
 		return err
 	}
 	if err := v.flushBatches(ctx); err != nil {
+		return err
+	}
+	if err := v.logDeferred(ctx); err != nil {
 		return err
 	}
 	return v.flushMeta(ctx)

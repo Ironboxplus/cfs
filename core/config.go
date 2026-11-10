@@ -99,9 +99,27 @@ type Config struct {
 	// GCGrace: how long an unreferenced pack, old log segment or checkpoint is
 	// kept before it may be deleted. Default 24h.
 	GCGrace time.Duration
-	// CheckpointEvery: upload a checkpoint after this many committed segments.
-	// Default 200; negative disables.
+	// CheckpointEvery: upload a checkpoint once this many segments have been
+	// written since the last one (Delta Lake's checkpointInterval), or their
+	// files add up to CheckpointBytes (Kopia's EpochAdvanceOnTotalSizeBytesThreshold).
+	// A checkpoint is also written when the lease is handed back with new
+	// segments. Defaults 10 and 10 MiB; a negative CheckpointEvery disables
+	// checkpoints, a negative CheckpointBytes the size trigger.
 	CheckpointEvery int
+	CheckpointBytes int64
+	// LogBatchAge and LogBatchMembers (AckStaged): the packs that are on the
+	// drive wait to be written to the log together, until the first of them has
+	// waited LogBatchAge or they hold LogBatchMembers members (restic's
+	// indexMaxAge and indexMaxBlobs), or the log has to be complete (Flush, a
+	// checkpoint, handing the lease back, Close). Other volumes see a new file
+	// after that time at most. Defaults 10 minutes and 50000; a negative
+	// LogBatchAge writes the log of every pack at once, as AckDurable always does.
+	LogBatchAge     time.Duration
+	LogBatchMembers int
+	// CleanupSafety: a checkpoint that has been on the drive this long makes
+	// the log segments it covers, and the checkpoints before it, garbage; the
+	// writer deletes them (Kopia's CleanupSafetyMargin). Default 4 hours.
+	CleanupSafety time.Duration
 	// StoreSuffixes: members with these suffixes are not compressed.
 	StoreSuffixes []string
 	// Shrink keeps a large file stored 1:1 when it is rewritten smaller than
@@ -176,7 +194,19 @@ func (c *Config) fill() error {
 		c.GCGrace = 24 * time.Hour
 	}
 	if c.CheckpointEvery == 0 {
-		c.CheckpointEvery = 200
+		c.CheckpointEvery = 10
+	}
+	if c.CheckpointBytes == 0 {
+		c.CheckpointBytes = 10 << 20
+	}
+	if c.LogBatchAge == 0 {
+		c.LogBatchAge = 10 * time.Minute
+	}
+	if c.LogBatchMembers <= 0 {
+		c.LogBatchMembers = 50000
+	}
+	if c.CleanupSafety <= 0 {
+		c.CleanupSafety = 4 * time.Hour
 	}
 	if c.StoreSuffixes == nil {
 		c.StoreSuffixes = DefaultStoreSuffixes

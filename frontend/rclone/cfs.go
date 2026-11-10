@@ -128,8 +128,28 @@ func init() {
 			Advanced: true,
 		}, {
 			Name:     "checkpoint_every",
-			Help:     "Upload a checkpoint after this many log segments (negative: never).",
-			Default:  200,
+			Help:     "Upload a checkpoint once this many log segments have been written since the last one (negative: never). A checkpoint is also written when the writer lease is handed back with new segments.",
+			Default:  10,
+			Advanced: true,
+		}, {
+			Name:     "checkpoint_bytes",
+			Help:     "Upload a checkpoint once the log segments since the last one add up to this much (negative: no size trigger).",
+			Default:  fs.SizeSuffix(10 << 20),
+			Advanced: true,
+		}, {
+			Name:     "log_batch_age",
+			Help:     "With ack=staged the packs that are on the remote wait to be written to the log together, for this long after the first of them (negative: each pack at once). Other volumes see a new file after that time at most.",
+			Default:  fs.Duration(10 * time.Minute),
+			Advanced: true,
+		}, {
+			Name:     "log_batch_members",
+			Help:     "...or until the waiting packs hold this many files.",
+			Default:  50000,
+			Advanced: true,
+		}, {
+			Name:     "cleanup_safety",
+			Help:     "A checkpoint that has been on the remote this long makes the log segments it covers, and the checkpoints before it, garbage, and the writer deletes them.",
+			Default:  fs.Duration(4 * time.Hour),
 			Advanced: true,
 		}, {
 			Name:     "retries",
@@ -161,6 +181,10 @@ type Options struct {
 	LeaseIdle       fs.Duration   `config:"lease_idle"`
 	GCGrace         fs.Duration   `config:"gc_grace"`
 	CheckpointEvery int           `config:"checkpoint_every"`
+	CheckpointBytes fs.SizeSuffix `config:"checkpoint_bytes"`
+	LogBatchAge     fs.Duration   `config:"log_batch_age"`
+	LogBatchMembers int           `config:"log_batch_members"`
+	CleanupSafety   fs.Duration   `config:"cleanup_safety"`
 	Retries         int           `config:"retries"`
 }
 
@@ -261,6 +285,10 @@ func openRef(ctx context.Context, key string, under func() (fs.Fs, error), opt *
 		LeaseIdle:       time.Duration(opt.LeaseIdle),
 		GCGrace:         time.Duration(opt.GCGrace),
 		CheckpointEvery: opt.CheckpointEvery,
+		CheckpointBytes: int64(opt.CheckpointBytes),
+		LogBatchAge:     time.Duration(opt.LogBatchAge),
+		LogBatchMembers: opt.LogBatchMembers,
+		CleanupSafety:   time.Duration(opt.CleanupSafety),
 		Logf:            func(f string, a ...any) { fs.Logf(nil, "cfs: "+f, a...) },
 	})
 	if err != nil {

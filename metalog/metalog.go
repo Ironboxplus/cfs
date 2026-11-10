@@ -44,6 +44,11 @@ type Record struct {
 // Segment is one atomic group of records. Segments are applied in Seq order.
 // Pack, when set, is the pack uploaded before the segment that its put records
 // point into.
+//
+// A segment may carry several commits at once (the log is written once for a
+// batch of packs): Seq is then the highest sequence number among them, Pack
+// and its facts belong to that commit, and Extra lists the others. The
+// records are in the order of the commits.
 type Segment struct {
 	Epoch uint64
 	Seq   uint64
@@ -52,7 +57,22 @@ type Segment struct {
 	PackBytes int64
 	PackSHA1  string
 	PackN     int
+	Extra     []PackFact
 	Records   []Record
+}
+
+// PackFact is a pack of a segment besides the one named by Segment.Pack, with
+// the sequence number (and epoch) of the commit that uploaded it.
+type PackFact struct {
+	Epoch uint64 `json:"epoch"`
+	Seq   uint64 `json:"seq"`
+	Name  string `json:"name"`
+	Bytes int64  `json:"bytes"`
+	SHA1  string `json:"sha1,omitempty"`
+	N     int    `json:"n"`
+	// R is how many of the segment's records belong to this commit, so that a
+	// volume that already has the commit (from a checkpoint) can skip them.
+	R int `json:"r,omitempty"`
 }
 
 // Ref names a stored segment or checkpoint.
@@ -68,8 +88,8 @@ func (r Ref) String() string { return fmt.Sprintf("%d-%d(%s)", r.Epoch, r.Seq, r
 // MetaLog stores segments and checkpoints.
 type MetaLog interface {
 	// AppendSegment returns once the segment is durable on the drive and has
-	// been verified there.
-	AppendSegment(ctx context.Context, seg Segment) error
+	// been verified there; it returns the size of the segment's file.
+	AppendSegment(ctx context.Context, seg Segment) (int64, error)
 	ListSegments(ctx context.Context) ([]Ref, error)
 	ReadSegment(ctx context.Context, ref Ref) (Segment, error)
 	DeleteSegment(ctx context.Context, ref Ref) error

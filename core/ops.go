@@ -697,7 +697,12 @@ func (v *Volume) flushMeta(ctx context.Context) error {
 	if err := v.writable(); err != nil {
 		return err
 	}
-	left, err := readPending(v.ix.db, "WHERE seg IS NOT NULL AND seg NOT IN (SELECT name FROM inflight)")
+	// The packs waiting for their segment come first, so that no segment of a
+	// later commit is written before theirs; their sealed rows go with them.
+	if err := v.logDeferred(ctx); err != nil {
+		return err
+	}
+	left, err := readPending(v.ix.db, "WHERE seg IS NOT NULL AND seg NOT IN (SELECT name FROM inflight) AND seg NOT IN (SELECT name FROM deferred)")
 	if err != nil {
 		return err
 	}
@@ -735,14 +740,15 @@ func (v *Volume) uploadMetaSeg(ctx context.Context, key string, rows []pendingRo
 	for _, r := range rows {
 		seg.Records = append(seg.Records, r.Rec)
 	}
-	if err := v.log.AppendSegment(ctx, seg); err != nil {
+	size, err := v.log.AppendSegment(ctx, seg)
+	if err != nil {
 		return err
 	}
 	crash.Point("meta_log_uploaded")
 	if _, err := v.ix.db.Exec("DELETE FROM pending WHERE seg=?", key); err != nil {
 		return err
 	}
-	v.segsNew.Add(1)
+	v.segLogged(size)
 	return nil
 }
 

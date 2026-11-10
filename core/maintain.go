@@ -203,34 +203,94 @@ func (v *Volume) GC(ctx context.Context) (GCReport, error) {
 		rep.OrphansDeleted++
 	}
 	// Old segments and checkpoints.
+	segs, cks, err := v.cleanLog(ctx)
+	rep.SegmentsDeleted, rep.CheckpointsDeleted = segs, cks
+	return rep, err
+}
+
+// cleanLog deletes the log the newest checkpoint that has been on the drive for
+// CleanupSafety makes garbage: the segments it covers, and the checkpoints
+// before it (Kopia deletes what a compaction replaced after its
+// CleanupSafetyMargin). Only the writer does it, and the deletes go one after
+// the other through the store's metadata gate. Volumes that are following the
+// writer find a segment missing and start again from the newest checkpoint.
+func (v *Volume) cleanLog(ctx context.Context) (segments, checkpoints int, err error) {
+	if v.ReadOnly() || v.fenced.Load() {
+		return 0, 0, nil
+	}
 	cks, err := v.log.ListCheckpoints(ctx)
 	if err != nil {
-		return rep, err
+		return 0, 0, err
 	}
-	if len(cks) >= 2 {
-		keepFrom := cks[len(cks)-2]
-		for _, c := range cks[:len(cks)-2] {
-			if time.Since(c.ModTime) >= graceDur && !c.ModTime.IsZero() {
-				if err := v.log.DeleteCheckpoint(ctx, c); err != nil && !isNotFound(err) {
-					return rep, err
-				}
-				rep.CheckpointsDeleted++
-			}
+	keep := -1
+	for i := len(cks) - 1; i >= 0; i-- {
+		if !cks[i].ModTime.IsZero() && time.Since(cks[i].ModTime) >= v.cfg.CleanupSafety {
+			keep = i
+			break
 		}
-		segs, err := v.log.ListSegments(ctx)
+	}
+	if keep < 0 {
+		return 0, 0, nil
+	}
+	segs, err := v.log.ListSegments(ctx)
+	if err != nil {
+		return 0, 0, err
+	}
+	for _, s := range segs {
+		if s.Seq <= cks[keep].Seq {
+			if err := v.log.DeleteSegment(ctx, s); err != nil && !isNotFound(err) {
+				return segments, checkpoints, err
+			}
+			segments++
+		}
+	}
+	for _, c := range cks[:keep] {
+		if err := v.log.DeleteCheckpoint(ctx, c); err != nil && !isNotFound(err) {
+			return segments, checkpoints, err
+		}
+		checkpoints++
+	}
+	return segments, checkpoints, nil
+}
+
+// MaintainReport is what MaintainLog did.
+type MaintainReport struct {
+	// CheckpointSeq is the sequence number the new checkpoint covers.
+	CheckpointSeq      uint64
+	SegmentsDeleted    int
+	CheckpointsDeleted int
+	Elapsed            time.Duration
+}
+
+// MaintainLog makes the next volume that opens cheap: it takes the lease, writes
+// the log of everything committed, uploads a checkpoint, cleans up what an old
+// enough checkpoint makes garbage, and hands the lease back. It fails with
+// ErrReadOnly while another writer holds the lease.
+func (v *Volume) MaintainLog(ctx context.Context) (MaintainReport, error) {
+	start := time.Now()
+	var rep MaintainReport
+	err := func() error {
+		end, err := v.beginWrite(ctx)
 		if err != nil {
-			return rep, err
+			return err
 		}
-		for _, s := range segs {
-			if s.Seq <= keepFrom.Seq && !s.ModTime.IsZero() && time.Since(s.ModTime) >= graceDur {
-				if err := v.log.DeleteSegment(ctx, s); err != nil && !isNotFound(err) {
-					return rep, err
-				}
-				rep.SegmentsDeleted++
-			}
+		defer end()
+		if err := v.Flush(ctx); err != nil {
+			return err
 		}
+		if err := v.Checkpoint(ctx); err != nil {
+			return err
+		}
+		rep.CheckpointSeq = v.ix.kvUint("last_ckpt_seq")
+		segs, cks, err := v.cleanLog(ctx)
+		rep.SegmentsDeleted, rep.CheckpointsDeleted = segs, cks
+		return err
+	}()
+	if err == nil {
+		v.handBack(true)
 	}
-	return rep, nil
+	rep.Elapsed = time.Since(start)
+	return rep, err
 }
 
 // Maintain runs a compaction, a checkpoint and a GC pass.
@@ -449,7 +509,11 @@ func (v *Volume) compareWithDrive(ctx context.Context) ([]mismatch, error) {
 	if err := v.ix.db.QueryRow("SELECT count(*) FROM pending").Scan(&pend); err != nil {
 		return nil, err
 	}
-	if pend > 0 {
+	var def int
+	if err := v.ix.db.QueryRow("SELECT count(*) FROM deferred").Scan(&def); err != nil {
+		return nil, err
+	}
+	if pend > 0 || def > 0 {
 		return nil, nil // the drive is legitimately behind
 	}
 	dir, err := os.MkdirTemp(v.cfg.StateDir, "fsck-")

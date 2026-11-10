@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/Ironboxplus/cfs/metalog"
 	"github.com/Ironboxplus/cfs/store"
@@ -62,7 +63,7 @@ func (v *Volume) fetchBaseCheckpoint(ctx context.Context, dbPath string) error {
 				err = ix.tx(func(tx *sql.Tx) error {
 					for _, q := range []string{
 						"DELETE FROM kv WHERE k IN ('writer_id','epoch','inited','dmv_intent','ddirs_complete')",
-						"DELETE FROM pending", "DELETE FROM inflight", "DELETE FROM staged", "DELETE FROM ddirs",
+						"DELETE FROM pending", "DELETE FROM inflight", "DELETE FROM staged", "DELETE FROM ddirs", "DELETE FROM deferred",
 					} {
 						if _, err := tx.Exec(q); err != nil {
 							return err
@@ -89,8 +90,31 @@ func (v *Volume) fetchBaseCheckpoint(ctx context.Context, dbPath string) error {
 // applySegment applies a segment to the local index and records its name.
 func (v *Volume) applySegment(seg metalog.Segment) error {
 	key := segKeyOf(seg.Epoch, seg.Seq)
+	base := v.ix.kvUint("base_seq")
 	return v.ix.tx(func(tx *sql.Tx) error {
-		for _, r := range seg.Records {
+		// A segment of several commits (batched logging) applies each of them
+		// in turn; one the index already has through a checkpoint is skipped.
+		recs := seg.Records
+		for _, x := range seg.Extra {
+			part := recs[:min(x.R, len(recs))]
+			recs = recs[len(part):]
+			if _, err := tx.Exec("INSERT OR IGNORE INTO segs(name) VALUES(?)", segKeyOf(x.Epoch, x.Seq)); err != nil {
+				return err
+			}
+			if x.Seq <= base {
+				continue
+			}
+			for _, r := range part {
+				if err := applyRecord(tx, r, x.Seq); err != nil {
+					return fmt.Errorf("segment %s: %w", key, err)
+				}
+			}
+			if _, err := tx.Exec("INSERT OR REPLACE INTO packs(name,epoch,seq,bytes,sha1,members,dead_at) VALUES(?,?,?,?,?,?,0)",
+				x.Name, x.Epoch, x.Seq, x.Bytes, x.SHA1, x.N); err != nil {
+				return err
+			}
+		}
+		for _, r := range recs {
 			if err := applyRecord(tx, r, seg.Seq); err != nil {
 				return fmt.Errorf("segment %s: %w", key, err)
 			}
@@ -106,34 +130,72 @@ func (v *Volume) applySegment(seg metalog.Segment) error {
 	})
 }
 
+// errSegmentGone: a segment that was listed is gone when it is read (the writer
+// cleaned the log up in the meantime).
+var errSegmentGone = errors.New("cfs: a log segment was deleted while it was being read")
+
 // catchUp applies the drive's segments this index hasn't seen, in sequence
-// order, and raises the sequence counter above everything on the drive.
+// order, and raises the sequence counter above everything on the drive. An
+// index that is behind the newest checkpoint is reloaded from it (the segments
+// before it may have been cleaned up), and so is one whose segment disappears
+// while it reads.
 func (v *Volume) catchUp(ctx context.Context) error {
+	for attempt := 0; ; attempt++ {
+		err := v.catchUpOnce(ctx)
+		if errors.Is(err, errSegmentGone) && attempt < 3 {
+			continue
+		}
+		return err
+	}
+}
+
+func (v *Volume) catchUpOnce(ctx context.Context) error {
 	refs, err := v.segRefs(ctx)
 	if err != nil {
 		return err
 	}
-	base := v.ix.kvUint("base_seq")
-	if len(refs) == 0 && base == 0 {
-		var n int
-		v.ix.db.QueryRow("SELECT count(*) FROM packs").Scan(&n)
-		if cks, _ := v.log.ListCheckpoints(ctx); n == 0 && len(cks) == 0 {
-			if err := v.recoverFromPacks(ctx); err != nil {
-				return err
-			}
-		}
+	cks, err := v.log.ListCheckpoints(ctx)
+	if err != nil {
+		return err
 	}
+	base := v.ix.kvUint("base_seq")
 	known := map[string]bool{}
 	rows, err := v.ix.db.Query("SELECT name FROM segs")
 	if err != nil {
 		return err
 	}
+	applied := base
 	for rows.Next() {
 		var n string
 		rows.Scan(&n)
 		known[n] = true
+		if _, s, ok := parseSegKey(n); ok {
+			applied = max(applied, s)
+		}
 	}
 	rows.Close()
+	if n := len(cks); n > 0 && cks[n-1].Seq > applied {
+		// Behind the newest checkpoint: start from it instead of the segments,
+		// some of which may be gone. (An index with nothing yet takes the
+		// segments, or its first checkpoint, as before.)
+		if !v.hasLocalWork() {
+			if err := v.reloadFromCheckpoint(ctx, cks); err != nil {
+				v.logf("cfs: not reloading from the newest checkpoint: %v", err)
+			} else {
+				base = v.ix.kvUint("base_seq")
+				known = map[string]bool{}
+			}
+		}
+	}
+	if len(refs) == 0 && base == 0 {
+		var n int
+		v.ix.db.QueryRow("SELECT count(*) FROM packs").Scan(&n)
+		if n == 0 && len(cks) == 0 {
+			if err := v.recoverFromPacks(ctx); err != nil {
+				return err
+			}
+		}
+	}
 	var top uint64
 	for i, ref := range refs {
 		top = max(top, ref.Seq)
@@ -142,10 +204,13 @@ func (v *Volume) catchUp(ctx context.Context) error {
 		}
 		seg, err := v.log.ReadSegment(ctx, ref)
 		if err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				return errSegmentGone
+			}
 			// The newest segment can be the leftover of an upload that was cut
 			// short: it was never verified, so nothing was acknowledged for it.
 			// Anywhere else an unreadable segment is real damage.
-			if i == len(refs)-1 && !errors.Is(err, store.ErrNotFound) && ctx.Err() == nil {
+			if i == len(refs)-1 && ctx.Err() == nil {
 				v.logf("cfs: ignoring unreadable newest log segment %s (an interrupted upload): %v", ref.Name, err)
 				if !v.ReadOnly() && !v.fenced.Load() {
 					if derr := v.log.DeleteSegment(ctx, ref); derr != nil {
@@ -160,27 +225,65 @@ func (v *Volume) catchUp(ctx context.Context) error {
 			return err
 		}
 	}
-	cks, err := v.log.ListCheckpoints(ctx)
-	if err != nil {
-		return err
-	}
+	var ckSeq uint64
 	for _, c := range cks {
 		top = max(top, c.Seq)
+		ckSeq = max(ckSeq, c.Seq)
 	}
-	if ents, err := v.st.List(ctx, CtlDir+"/packs"); err == nil {
-		for _, e := range ents {
-			if m := packRE.FindStringSubmatch(e.Name()); m != nil {
-				s, _ := strconv.ParseUint(m[2], 10, 64)
-				top = max(top, s)
+	var since, bytes int64
+	for _, r := range refs {
+		if r.Seq > ckSeq {
+			since++
+			bytes += r.Size
+		}
+	}
+	v.segsNew.Store(since)
+	v.segBytes.Store(bytes)
+	if !v.ReadOnly() { // a reader never allocates a number
+		if ents, err := v.st.List(ctx, CtlDir+"/packs"); err == nil {
+			for _, e := range ents {
+				if m := packRE.FindStringSubmatch(e.Name()); m != nil {
+					s, _ := strconv.ParseUint(m[2], 10, 64)
+					top = max(top, s)
+				}
 			}
 		}
 	}
 	return v.ix.raiseSeq(top)
 }
 
+// reloadFromCheckpoint replaces the index with the newest usable checkpoint.
+func (v *Volume) reloadFromCheckpoint(ctx context.Context, cks []metalog.Ref) error {
+	for i := len(cks) - 1; i >= 0; i-- {
+		tmp := filepath.Join(v.cfg.StateDir, "spool", fmt.Sprintf("reload-%d.db", time.Now().UnixNano()))
+		if err := os.MkdirAll(filepath.Dir(tmp), 0o755); err != nil {
+			return err
+		}
+		err := v.log.FetchCheckpoint(ctx, cks[i], tmp)
+		if err == nil {
+			err = v.ix.loadCheckpointFile(ctx, tmp, cks[i].Seq)
+		}
+		for _, ext := range []string{"", "-wal", "-shm"} {
+			os.Remove(tmp + ext)
+		}
+		if err == nil {
+			if v.dc != nil {
+				v.dc.reset()
+			}
+			v.logf("cfs: reloaded the index from checkpoint %s", cks[i].Name)
+			return nil
+		}
+		v.logf("cfs: checkpoint %s unusable, trying an older one: %v", cks[i].Name, err)
+	}
+	return errors.New("no usable checkpoint")
+}
+
 // recoverLocal finishes what a crash of this process interrupted: a directory
 // move that was only half done, and log segments that were sealed locally.
 func (v *Volume) recoverLocal(ctx context.Context) error {
+	if err := v.recoverDeferred(ctx); err != nil {
+		return err
+	}
 	if s, ok := v.ix.kvGet("dmv_intent"); ok {
 		var rec metalog.Record
 		if err := json.Unmarshal([]byte(s), &rec); err != nil {
@@ -386,8 +489,16 @@ func (v *Volume) Checkpoint(ctx context.Context) error {
 		return err
 	}
 	v.segsNew.Store(0)
+	v.segBytes.Store(0)
 	_ = v.ix.kvSet("last_ckpt_seq", strconv.FormatUint(seq, 10))
 	_ = v.ix.kvSet("last_ckpt_at", strconv.FormatInt(nowUnix(), 10))
+	// What an older checkpoint has made garbage goes now, if it has been on
+	// the drive long enough.
+	if segs, cks, err := v.cleanLog(ctx); err != nil {
+		v.logf("cfs: cleaning the log: %v", err)
+	} else if segs+cks > 0 {
+		v.logf("cfs: cleaned the log: %d segments and %d checkpoints deleted", segs, cks)
+	}
 	return nil
 }
 
