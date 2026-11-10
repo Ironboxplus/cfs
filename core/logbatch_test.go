@@ -446,7 +446,7 @@ func TestLogMaintainMakesTheNextOpenCheap(t *testing.T) {
 // sealed row's own segment, or a rebuild replays "move a to b" before "put a"
 // and ends with a, not b. (This is what the crash test staged:90 found.) With
 // restart set, the process dies in that state and the next start writes it.
-func TestLogBatchSegmentDoesNotReachOverASealedCommit(t *testing.T) {
+func TestLogBatchSegmentsDoNotReachOverASealedCommit(t *testing.T) {
 	if os.Getenv("CFS_TEST_ACK") == "durable" {
 		t.Skip("batched logging is the staged mode")
 	}
