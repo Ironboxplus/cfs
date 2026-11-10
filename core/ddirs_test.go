@@ -61,6 +61,9 @@ func TestBigPutIntoANewDeepFolderTouchesOnlyItsPath(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	if err := w.TakeLease(ctx); err != nil { // its root folder is not what is measured
+		t.Fatal(err)
+	}
 	l0, m0 := oc.folderLists.Load(), oc.mkdirs.Load()
 	put("new/deep/er/path/big.bin")
 	l1, m1 := oc.folderLists.Load()-l0, oc.mkdirs.Load()-m0
