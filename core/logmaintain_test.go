@@ -23,7 +23,7 @@ func writeRounds(t *testing.T, v *core.Volume, want map[string][]byte, prefix st
 
 // MaintainLog writes a checkpoint only when a segment came after the newest one
 // on the drive.
-func TestMaintainLogWritesNoCheckpointWithoutNewSegments(t *testing.T) {
+func TestLogMaintainWritesNoCheckpointWithoutNewSegments(t *testing.T) {
 	ctx := context.Background()
 	drive := t.TempDir()
 	v, _ := openCounting(t, drive, t.TempDir(), func(c *core.Config) { c.CheckpointEvery = -1 })
@@ -62,7 +62,7 @@ func TestMaintainLogWritesNoCheckpointWithoutNewSegments(t *testing.T) {
 // is already on the drive and older than the safety time covers the segments. A
 // checkpoint superseded by a newer one is deleted once that is old enough, and a
 // fresh volume then opens with one checkpoint and reads every file.
-func TestMaintainLogCleansWhenTheCheckpointUploadFails(t *testing.T) {
+func TestLogMaintainCleansWhenTheCheckpointUploadFails(t *testing.T) {
 	ctx := context.Background()
 	drive := t.TempDir()
 	v, oc := openCounting(t, drive, t.TempDir(), func(c *core.Config) {
