@@ -3,6 +3,7 @@ package core_test
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -24,6 +25,8 @@ type opCounter struct {
 	segReads, ckptReads, lists, packPuts, packReads atomic.Int64
 	// folderLists counts the listings of the drive's folders (not of the control directory), mkdirs the folders made.
 	folderLists, mkdirs atomic.Int64
+	// failCkptPut makes every upload of a checkpoint fail, as the drive's 403 did.
+	failCkptPut atomic.Bool
 }
 
 func (c *opCounter) Open(ctx context.Context, p string, off, n int64) (io.ReadCloser, error) {
@@ -54,6 +57,9 @@ func (c *opCounter) Mkdir(ctx context.Context, dir string) error {
 func (c *opCounter) Put(ctx context.Context, p string, src store.Source, o store.PutOpts) error {
 	if strings.HasPrefix(p, core.CtlDir+"/packs/") {
 		c.packPuts.Add(1)
+	}
+	if strings.HasPrefix(p, core.CtlDir+"/ckpt/") && c.failCkptPut.Load() {
+		return errors.New("injected: the drive refuses the checkpoint upload")
 	}
 	return c.Store.Put(ctx, p, src, o)
 }

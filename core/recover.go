@@ -459,17 +459,46 @@ func (v *Volume) Refresh(ctx context.Context) error {
 // snapshot and the segments after it. It waits for packs in commit, so the
 // snapshot is a consistent cut of the log.
 func (v *Volume) Checkpoint(ctx context.Context) error {
-	if err := v.writable(); err != nil {
+	if _, _, err := v.writeCheckpoint(ctx, false); err != nil {
 		return err
 	}
+	// What an older checkpoint has made garbage goes now, if it has been on
+	// the drive long enough.
+	if rep, err := v.cleanLog(ctx); err != nil {
+		v.logf("cfs: cleaning the log: %v", err)
+	} else if rep.Segments+rep.Checkpoints+rep.Failed > 0 {
+		v.logf("cfs: cleaned the log: %d segments and %d checkpoints deleted, %d deletes failed", rep.Segments, rep.Checkpoints, rep.Failed)
+	}
+	return nil
+}
+
+// writeCheckpoint uploads the snapshot. With onlyIfNew it first lists the
+// drive's checkpoints and does nothing when the newest one already covers every
+// segment there is; seq is then that newest checkpoint's. It does not clean up.
+func (v *Volume) writeCheckpoint(ctx context.Context, onlyIfNew bool) (seq uint64, written bool, err error) {
+	if err := v.writable(); err != nil {
+		return 0, false, err
+	}
 	if err := v.flushMeta(ctx); err != nil {
-		return err
+		return 0, false, err
 	}
 	v.ckptOne.Lock()
 	defer v.ckptOne.Unlock()
+	if onlyIfNew {
+		cks, err := v.log.ListCheckpoints(ctx)
+		if err != nil {
+			return 0, false, err
+		}
+		if len(cks) > 0 {
+			newest := cks[len(cks)-1].Seq
+			if v.ix.kvUint("next_seq") <= newest+1 {
+				return newest, false, nil
+			}
+		}
+	}
 	tf, err := os.CreateTemp(filepath.Join(v.cfg.StateDir, "spool"), "ckpt-*.db")
 	if err != nil {
-		return err
+		return 0, false, err
 	}
 	tmp := tf.Name()
 	tf.Close()
@@ -477,31 +506,24 @@ func (v *Volume) Checkpoint(ctx context.Context) error {
 	defer os.Remove(tmp)
 	v.structMu.Lock()
 	v.ckptMu.Lock()
-	seq := v.ix.kvUint("next_seq") - 1
+	seq = v.ix.kvUint("next_seq") - 1
 	_, err = v.ix.db.Exec("VACUUM INTO ?", tmp)
 	v.ckptMu.Unlock()
 	v.structMu.Unlock()
 	if err != nil {
-		return fmt.Errorf("cfs: snapshot index: %w", err)
+		return 0, false, fmt.Errorf("cfs: snapshot index: %w", err)
 	}
 	if err := v.checkLease(ctx); err != nil {
-		return err
+		return 0, false, err
 	}
 	if err := v.log.PutCheckpoint(ctx, v.epoch, seq, tmp); err != nil {
-		return err
+		return 0, false, err
 	}
 	v.segsNew.Store(0)
 	v.segBytes.Store(0)
 	_ = v.ix.kvSet("last_ckpt_seq", strconv.FormatUint(seq, 10))
 	_ = v.ix.kvSet("last_ckpt_at", strconv.FormatInt(nowUnix(), 10))
-	// What an older checkpoint has made garbage goes now, if it has been on
-	// the drive long enough.
-	if segs, cks, err := v.cleanLog(ctx); err != nil {
-		v.logf("cfs: cleaning the log: %v", err)
-	} else if segs+cks > 0 {
-		v.logf("cfs: cleaned the log: %d segments and %d checkpoints deleted", segs, cks)
-	}
-	return nil
+	return seq, true, nil
 }
 
 func (v *Volume) maybeCheckpoint() {

@@ -8,6 +8,7 @@ import (
 	"crypto/sha1"
 	"database/sql"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -203,8 +204,8 @@ func (v *Volume) GC(ctx context.Context) (GCReport, error) {
 		rep.OrphansDeleted++
 	}
 	// Old segments and checkpoints.
-	segs, cks, err := v.cleanLog(ctx)
-	rep.SegmentsDeleted, rep.CheckpointsDeleted = segs, cks
+	cl, err := v.cleanLog(ctx)
+	rep.SegmentsDeleted, rep.CheckpointsDeleted = cl.Segments, cl.Checkpoints
 	return rep, err
 }
 
@@ -214,13 +215,13 @@ func (v *Volume) GC(ctx context.Context) (GCReport, error) {
 // CleanupSafetyMargin). Only the writer does it, and the deletes go one after
 // the other through the store's metadata gate. Volumes that are following the
 // writer find a segment missing and start again from the newest checkpoint.
-func (v *Volume) cleanLog(ctx context.Context) (segments, checkpoints int, err error) {
+func (v *Volume) cleanLog(ctx context.Context) (rep cleanReport, err error) {
 	if v.ReadOnly() || v.fenced.Load() {
-		return 0, 0, nil
+		return rep, nil
 	}
 	cks, err := v.log.ListCheckpoints(ctx)
 	if err != nil {
-		return 0, 0, err
+		return rep, err
 	}
 	keep := -1
 	for i := len(cks) - 1; i >= 0; i-- {
@@ -230,42 +231,59 @@ func (v *Volume) cleanLog(ctx context.Context) (segments, checkpoints int, err e
 		}
 	}
 	if keep < 0 {
-		return 0, 0, nil
+		return rep, nil
 	}
 	segs, err := v.log.ListSegments(ctx)
 	if err != nil {
-		return 0, 0, err
+		return rep, err
 	}
+	// One file that won't go must not hold back the rest; the next pass tries it
+	// again.
 	for _, s := range segs {
 		if s.Seq <= cks[keep].Seq {
 			if err := v.log.DeleteSegment(ctx, s); err != nil && !isNotFound(err) {
-				return segments, checkpoints, err
+				v.logf("cfs: delete log segment %s: %v", s.Name, err)
+				rep.Failed++
+				continue
 			}
-			segments++
+			rep.Segments++
 		}
 	}
 	for _, c := range cks[:keep] {
 		if err := v.log.DeleteCheckpoint(ctx, c); err != nil && !isNotFound(err) {
-			return segments, checkpoints, err
+			v.logf("cfs: delete checkpoint %s: %v", c.Name, err)
+			rep.Failed++
+			continue
 		}
-		checkpoints++
+		rep.Checkpoints++
 	}
-	return segments, checkpoints, nil
+	return rep, nil
 }
+
+// cleanReport says what cleanLog deleted, and how many deletes failed.
+type cleanReport struct{ Segments, Checkpoints, Failed int }
 
 // MaintainReport is what MaintainLog did.
 type MaintainReport struct {
-	// CheckpointSeq is the sequence number the new checkpoint covers.
+	// CheckpointWritten is false when the drive's newest checkpoint already
+	// covered every segment, or when writing it failed.
+	CheckpointWritten bool
+	// CheckpointSeq is the sequence number the checkpoint written covers, or the
+	// drive's newest checkpoint's when none was written.
 	CheckpointSeq      uint64
 	SegmentsDeleted    int
 	CheckpointsDeleted int
+	DeletesFailed      int
 	Elapsed            time.Duration
 }
 
 // MaintainLog makes the next volume that opens cheap: it takes the lease, writes
-// the log of everything committed, uploads a checkpoint, cleans up what an old
-// enough checkpoint makes garbage, and hands the lease back. It fails with
-// ErrReadOnly while another writer holds the lease.
+// the log of everything committed, uploads a checkpoint when the drive's newest
+// one doesn't cover it all, cleans up what an old enough checkpoint on the drive
+// makes garbage, and hands the lease back. The cleanup does not wait for the
+// checkpoint: when the upload fails the report still carries what was deleted,
+// together with the error. It fails with ErrReadOnly while another writer holds
+// the lease.
 func (v *Volume) MaintainLog(ctx context.Context) (MaintainReport, error) {
 	start := time.Now()
 	var rep MaintainReport
@@ -278,13 +296,11 @@ func (v *Volume) MaintainLog(ctx context.Context) (MaintainReport, error) {
 		if err := v.Flush(ctx); err != nil {
 			return err
 		}
-		if err := v.Checkpoint(ctx); err != nil {
-			return err
-		}
-		rep.CheckpointSeq = v.ix.kvUint("last_ckpt_seq")
-		segs, cks, err := v.cleanLog(ctx)
-		rep.SegmentsDeleted, rep.CheckpointsDeleted = segs, cks
-		return err
+		seq, written, cerr := v.writeCheckpoint(ctx, true)
+		rep.CheckpointSeq, rep.CheckpointWritten = seq, written
+		cl, lerr := v.cleanLog(ctx)
+		rep.SegmentsDeleted, rep.CheckpointsDeleted, rep.DeletesFailed = cl.Segments, cl.Checkpoints, cl.Failed
+		return errors.Join(cerr, lerr)
 	}()
 	if err == nil {
 		v.handBack(true)
