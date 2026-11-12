@@ -71,13 +71,15 @@ jobs:
           restore-keys: |
             go-mod-${{ steps.rp.outputs.year-week }}-
             go-mod-
-      # Compiled packages depend on the OS and Go version and on what the job builds: one key per job.
+      # Compiled packages depend on the OS and Go version and on what the job builds: one key per job,
+      # saved by every run under its commit and restored from the newest.
       - name: Build cache
         uses: actions/cache@v6
         with:
           path: ${{ steps.go-paths.outputs.build-cache }}
-          key: go-build-check-${{ steps.rp.outputs.os-version }}-go${{ steps.setup-go.outputs.go-version }}-${{ steps.rp.outputs.year-week }}-${{ hashFiles('go.sum') }}
+          key: go-build-check-${{ steps.rp.outputs.os-version }}-go${{ steps.setup-go.outputs.go-version }}-${{ steps.rp.outputs.year-week }}-${{ hashFiles('go.sum') }}-${{ github.sha }}
           restore-keys: |
+            go-build-check-${{ steps.rp.outputs.os-version }}-go${{ steps.setup-go.outputs.go-version }}-${{ steps.rp.outputs.year-week }}-${{ hashFiles('go.sum') }}-
             go-build-check-${{ steps.rp.outputs.os-version }}-go${{ steps.setup-go.outputs.go-version }}-${{ steps.rp.outputs.year-week }}-
             go-build-check-${{ steps.rp.outputs.os-version }}-go${{ steps.setup-go.outputs.go-version }}-
       # The patched rclone tree only changes with the patches.
@@ -148,13 +150,15 @@ jobs:
           restore-keys: |
             go-mod-${{ steps.rp.outputs.year-week }}-
             go-mod-
-      # Compiled packages depend on the OS and Go version and on what the job builds: one key per job.
+      # Compiled packages depend on the OS and Go version and on what the job builds: one key per job,
+      # saved by every run under its commit and restored from the newest.
       - name: Build cache
         uses: actions/cache@v6
         with:
           path: ${{ steps.go-paths.outputs.build-cache }}
-          key: go-build-${{ matrix.name }}-${{ matrix.os }}-${{ steps.rp.outputs.os-version }}-go${{ steps.setup-go.outputs.go-version }}-${{ steps.rp.outputs.year-week }}-${{ hashFiles('go.sum') }}
+          key: go-build-${{ matrix.name }}-${{ matrix.os }}-${{ steps.rp.outputs.os-version }}-go${{ steps.setup-go.outputs.go-version }}-${{ steps.rp.outputs.year-week }}-${{ hashFiles('go.sum') }}-${{ github.sha }}
           restore-keys: |
+            go-build-${{ matrix.name }}-${{ matrix.os }}-${{ steps.rp.outputs.os-version }}-go${{ steps.setup-go.outputs.go-version }}-${{ steps.rp.outputs.year-week }}-${{ hashFiles('go.sum') }}-
             go-build-${{ matrix.name }}-${{ matrix.os }}-${{ steps.rp.outputs.os-version }}-go${{ steps.setup-go.outputs.go-version }}-${{ steps.rp.outputs.year-week }}-
             go-build-${{ matrix.name }}-${{ matrix.os }}-${{ steps.rp.outputs.os-version }}-go${{ steps.setup-go.outputs.go-version }}-
       # The patched rclone tree only changes with the patches.
@@ -172,9 +176,13 @@ jobs:
           PKGS: ${{ matrix.pkgs }}
           RUN: ${{ matrix.run }}
           VERBOSE: ${{ (startsWith(matrix.name, 'core-read') || startsWith(matrix.name, 'core-log')) && '-v' || '' }}  # the read and log tests log their measurements
+          # Go's test cache serves the packages a commit doesn't touch. It can't see
+          # a binary a test builds or runs itself (the crash writer, the OpenList
+          # server): those jobs always run.
+          COUNT: ${{ (matrix.name == 'core-crash' || matrix.name == 'core-logcrash' || matrix.name == 'core-lease' || startsWith(matrix.name, 'bb-')) && '-count=1' || '' }}
         run: |
           set -o pipefail
-          go test -count=1 -timeout 20m $VERBOSE -run "$RUN" $PKGS 2>&1 | tee "$RUNNER_TEMP/test.log"
+          go test $COUNT -timeout 20m $VERBOSE -run "$RUN" $PKGS 2>&1 | tee "$RUNNER_TEMP/test.log"
       - name: tail of the log
         if: failure()
         run: tail -c 200000 "$RUNNER_TEMP/test.log" > "$RUNNER_TEMP/test-tail.log" || true
@@ -230,13 +238,15 @@ jobs:
           restore-keys: |
             go-mod-${{ steps.rp.outputs.year-week }}-
             go-mod-
-      # Compiled packages depend on the OS and Go version and on what the job builds: one key per job.
+      # Compiled packages depend on the OS and Go version and on what the job builds: one key per job,
+      # saved by every run under its commit and restored from the newest.
       - name: Build cache
         uses: actions/cache@v6
         with:
           path: ${{ steps.go-paths.outputs.build-cache }}
-          key: go-build-long-${{ steps.rp.outputs.os-version }}-go${{ steps.setup-go.outputs.go-version }}-${{ steps.rp.outputs.year-week }}-${{ hashFiles('go.sum') }}
+          key: go-build-long-${{ steps.rp.outputs.os-version }}-go${{ steps.setup-go.outputs.go-version }}-${{ steps.rp.outputs.year-week }}-${{ hashFiles('go.sum') }}-${{ github.sha }}
           restore-keys: |
+            go-build-long-${{ steps.rp.outputs.os-version }}-go${{ steps.setup-go.outputs.go-version }}-${{ steps.rp.outputs.year-week }}-${{ hashFiles('go.sum') }}-
             go-build-long-${{ steps.rp.outputs.os-version }}-go${{ steps.setup-go.outputs.go-version }}-${{ steps.rp.outputs.year-week }}-
             go-build-long-${{ steps.rp.outputs.os-version }}-go${{ steps.setup-go.outputs.go-version }}-
       # The patched rclone tree only changes with the patches.
