@@ -108,7 +108,12 @@ func main() {
 	}
 	wg.Wait()
 	// A change that no pack is open to carry: the log of it is a segment of its
-	// own, which the crash point meta_log_uploaded waits for.
+	// own, which the crash point meta_log_uploaded waits for. Everything staged
+	// is committed first, or (staged ack) the commit of a pack still to come
+	// carries the change in its own segment and that point is never reached.
+	if err := v.Flush(ctx); err != nil {
+		fmt.Fprintln(os.Stderr, "flush:", err)
+	}
 	if err := v.Mkdir(ctx, "zz-final"); err != nil {
 		fmt.Fprintln(os.Stderr, "mkdir:", err)
 	}
