@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -229,4 +230,65 @@ func TestLeaseLegacyUnreadableIsHeldUntilStale(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(drive, ".cfs", "lease.json")); !os.IsNotExist(err) {
 		t.Fatalf("lease.json after the takeover: %v", err)
 	}
+}
+
+// stuckLease is a drive on which the upload of a lease file doesn't finish
+// while stuck is set (115 with every transfer slot taken, or an upload that
+// hangs), until its context ends.
+type stuckLease struct {
+	store.Store
+	stuck   atomic.Bool
+	release chan struct{}
+}
+
+func (s *stuckLease) Put(ctx context.Context, p string, src store.Source, o store.PutOpts) error {
+	if s.stuck.Load() && strings.HasPrefix(p, core.CtlDir+"/lease/") {
+		select {
+		case <-s.release:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return s.Store.Put(ctx, p, src, o)
+}
+
+// A heartbeat whose write of the lease hangs holds up no commit: the commit
+// path reads the lease without waiting for the write (2026-11-12, medical-to-115:
+// the heartbeat's upload hung, every pack commit waited for it in its lease
+// check, and the staging area filled up until every put timed out).
+func TestLeaseHungHeartbeatWriteHoldsUpNoCommit(t *testing.T) {
+	ctx := context.Background()
+	drive := t.TempDir()
+	sl := &stuckLease{Store: testutil.LocalStore(t, drive), release: make(chan struct{})}
+	st, _ := testutil.Stacked(sl, aspectOpts())
+	cfg := testutil.FastConfig(t.TempDir())
+	cfg.LeaseTTL = 1200 * time.Millisecond // a heartbeat every 400 ms; a commit reads the lease 200 ms after the last access
+	v, err := core.Open(ctx, st, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer v.Close(ctx)
+	defer close(sl.release)
+	if err := v.TakeLease(ctx); err != nil {
+		t.Fatal(err)
+	}
+	sl.stuck.Store(true)
+	time.Sleep(600 * time.Millisecond) // the heartbeat is in its write, and a commit has to read the lease
+	done := make(chan error, 1)
+	go func() {
+		if _, err := v.Put(ctx, "c.txt", strings.NewReader("commit me"), 9, time.Now()); err != nil {
+			done <- err
+			return
+		}
+		done <- v.Flush(ctx)
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("commit while the heartbeat's write hangs: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the commit waited for the heartbeat's hung write of the lease")
+	}
+	sl.stuck.Store(false)
 }
