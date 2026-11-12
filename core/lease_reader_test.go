@@ -183,13 +183,13 @@ func TestLeaseFirstChangeTakesItAndIdleHandsItBack(t *testing.T) {
 	}
 	first := l.Epoch
 
-	waitFor(t, "the idle volume hands the lease back", 10*time.Second, func() bool {
+	// The released lease lands on the drive before the hand-back is over (it
+	// then removes the writer's previous lease file, and only then makes the
+	// volume a reader).
+	waitFor(t, "the idle volume hands the lease back and is a reader", 10*time.Second, func() bool {
 		l, _ := readLeaseFile(t, drive)
-		return l.Released
+		return l.Released && v.ReadOnly()
 	})
-	if !v.ReadOnly() {
-		t.Error("the volume still thinks it is the writer")
-	}
 	handed := driveBytes(t, drive)
 	time.Sleep(2500 * time.Millisecond) // two heartbeats would be due
 	sameDrive(t, "after the hand-back", handed, driveBytes(t, drive))
