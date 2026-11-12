@@ -126,12 +126,16 @@ type Volume struct {
 	leaseDone  bool         // the lease has been released: no heartbeat writes it again; leaseMu
 	leaseAt    atomic.Int64 // unix nanos of the last successful read or write of the lease
 
-	// The lease files (see readLease); leaseFilesMu guards them.
-	leaseFilesMu sync.Mutex
-	leaseSeen    []string // names the last listing of the lease directory found
+	// The lease files (see readLease). leaseWriteMu is held for a whole write of
+	// the lease, uploads included, and guards leaseOld and leaseLastHB;
+	// leaseSeenMu is only held in memory and guards leaseSeen and leaseLegacy, so
+	// that reading the lease (every commit's check) never waits for a write.
+	leaseWriteMu sync.Mutex
 	leaseOld     []string // names that the next write of the lease supersedes and removes
-	leaseLegacy  bool     // the last listing fell back to lease.json, which a write removes
 	leaseLastHB  int64    // heartbeat of the last lease file written, in unix millis
+	leaseSeenMu  sync.Mutex
+	leaseSeen    []string // names the last listing of the lease directory found
+	leaseLegacy  bool     // a listing fell back to lease.json, which a write removes
 }
 
 func (v *Volume) logf(format string, args ...any) { v.cfg.Logf(format, args...) }
@@ -422,9 +426,9 @@ func (v *Volume) readLease(ctx context.Context) (lease, bool, error) {
 			l, ok = c, true
 		}
 	}
-	v.leaseFilesMu.Lock()
+	v.leaseSeenMu.Lock()
 	v.leaseSeen = seen
-	v.leaseFilesMu.Unlock()
+	v.leaseSeenMu.Unlock()
 	if ok {
 		return l, true, nil
 	}
@@ -443,9 +447,9 @@ func (v *Volume) readLegacyLease(ctx context.Context) (lease, bool, error) {
 	if err != nil {
 		return lease{}, false, err
 	}
-	v.leaseFilesMu.Lock()
+	v.leaseSeenMu.Lock()
 	v.leaseLegacy = true
-	v.leaseFilesMu.Unlock()
+	v.leaseSeenMu.Unlock()
 	rc, err := v.st.Open(ctx, legacyLeasePath, 0, -1)
 	if errors.Is(err, store.ErrNotFound) {
 		return lease{}, false, nil
@@ -467,10 +471,11 @@ func (v *Volume) readLegacyLease(ctx context.Context) (lease, bool, error) {
 // supersedes: the file this writer wrote before, the files the last listing
 // found (none of them comes after it: the writer would have been fenced, or
 // would not have taken the lease) and lease.json. A removal that fails is
-// tried again after the next write.
+// tried again after the next write. Only writes of the lease wait for each
+// other: a read of the lease never waits for an upload that hangs.
 func (v *Volume) writeLease(ctx context.Context, released bool) error {
-	v.leaseFilesMu.Lock()
-	defer v.leaseFilesMu.Unlock()
+	v.leaseWriteMu.Lock()
+	defer v.leaseWriteMu.Unlock()
 	l := lease{Writer: v.writerID, Epoch: v.epoch, Heartbeat: max(time.Now().UnixMilli(), v.leaseLastHB+1), Released: released}
 	l.Host, _ = os.Hostname()
 	b, _ := json.Marshal(l)
@@ -480,13 +485,17 @@ func (v *Volume) writeLease(ctx context.Context, released bool) error {
 	}
 	v.leaseAt.Store(time.Now().UnixNano())
 	v.leaseLastHB = l.Heartbeat
+	v.leaseSeenMu.Lock()
+	seen, legacy := v.leaseSeen, v.leaseLegacy
+	v.leaseSeen, v.leaseLegacy = nil, false
+	v.leaseSeenMu.Unlock()
 	old := v.leaseOld
-	for _, n := range v.leaseSeen {
+	for _, n := range seen {
 		if c, ok := parseLeaseName(n); ok && l.after(c) {
 			old = append(old, n)
 		}
 	}
-	v.leaseSeen, v.leaseOld = nil, []string{name}
+	v.leaseOld = []string{name}
 	done := map[string]bool{name: true}
 	for _, n := range old {
 		if done[n] {
@@ -498,11 +507,12 @@ func (v *Volume) writeLease(ctx context.Context, released bool) error {
 			v.leaseOld = append(v.leaseOld, n)
 		}
 	}
-	if v.leaseLegacy {
+	if legacy {
 		if err := v.st.Remove(ctx, legacyLeasePath); err != nil && !errors.Is(err, store.ErrNotFound) {
 			v.logf("cfs: removing %s: %v", legacyLeasePath, err)
-		} else {
-			v.leaseLegacy = false
+			v.leaseSeenMu.Lock()
+			v.leaseLegacy = true
+			v.leaseSeenMu.Unlock()
 		}
 	}
 	return nil
