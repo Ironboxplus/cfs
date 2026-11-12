@@ -48,6 +48,9 @@ func (e *env) open() {
 	base := testutil.LocalStore(e.t, e.drive)
 	st, m := testutil.Stacked(base, e.opts)
 	cfg := testutil.FastConfig(e.state)
+	// Some of these tests count the drive's calls: no heartbeat (a listing, a
+	// put and a removal of the lease files) is due while they run.
+	cfg.LeaseTTL = 30 * time.Minute
 	if e.tweak != nil {
 		e.tweak(&cfg)
 	}

@@ -3,8 +3,8 @@ package core_test
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -147,8 +147,8 @@ func TestFencedWriterStops(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Another writer takes over: all it has to do is publish a higher epoch.
-	lease, _ := json.Marshal(map[string]any{"writer": "someone-else", "epoch": a.Epoch() + 1, "heartbeat_ms": time.Now().UnixMilli()})
-	if err := os.WriteFile(filepath.Join(drive, ".cfs", "lease.json"), lease, 0o644); err != nil {
+	name := fmt.Sprintf("%020d-%020d-held-someone-else.json", a.Epoch()+1, time.Now().UnixMilli())
+	if err := os.WriteFile(filepath.Join(drive, ".cfs", "lease", name), []byte("{}"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	// A commit within LeaseTTL/6 of the last lease access skips the read; a real

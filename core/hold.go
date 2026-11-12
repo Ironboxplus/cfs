@@ -73,7 +73,7 @@ func (v *Volume) becomeWriter(ctx context.Context) error {
 	if !v.readOnly.Load() {
 		return nil
 	}
-	l, ok, err := v.readLeaseOrAbsent(ctx)
+	l, ok, err := v.readLease(ctx)
 	if err != nil {
 		return err
 	}

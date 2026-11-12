@@ -89,7 +89,7 @@ Other measurements (small files, random bytes, `pack_max_bytes` set so that byte
 - A move onto an existing name (large over small, small over large) was several steps with a crash window that lost the target. Journaled (`mv:` keys) and completed at the next start.
 - A large file shadowed by a packed file of the same name could survive a crash between the commit and its removal (found by random kills in staged mode). Journaled before the commit uploads anything (`stray:` keys).
 - A large upload over a small file: a crash between upload and index change left the small file shadowing a loose one. Journaled (`putbig:` keys); an unacknowledged upload is taken back at the next start.
-- A lease file truncated by a killed writer made the volume unopenable ("unreadable lease: EOF"). Now taken over like a stale lease.
+- A lease file truncated by a killed writer made the volume unopenable ("unreadable lease: EOF"). It was then taken over like a stale lease, which on 115 let a second writer take a live writer's volume: the lease file, rewritten in place, read half written 304 times in one run while its writer was alive (2026-11-12). The lease is now a directory of files written once each (`.cfs/lease/<epoch>-<heartbeat>-<held|released>-<writer>.json`, as restic's locks): who holds it comes from a listing, no lease file is read, and a writer removes its previous file after writing the next. A legacy `lease.json` that can't be read counts as held from its modification time until it is past the TTL.
 - Directories that only staged files live in don't exist on the drive; every Put under one listed it again (507 lists for 2000 files). Negative listing cache.
 - `Close` with a pack still filling and the drive down left its spool file open.
 

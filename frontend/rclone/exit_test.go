@@ -1,11 +1,11 @@
 package cfsrclone_test
 
 import (
-	"bytes"
 	"context"
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -36,7 +36,7 @@ func (f *slowLease) wrap(o fs.Object, err error) (fs.Object, error) {
 }
 
 func (f *slowLease) delay(remote string) {
-	if f.slow.Load() && strings.HasSuffix(remote, "lease.json") {
+	if f.slow.Load() && strings.Contains(remote, ".cfs/lease/") {
 		time.Sleep(800 * time.Millisecond)
 	}
 }
@@ -101,12 +101,18 @@ func TestSharedVolumeCloseAllWaitsForAShutdownInFlight(t *testing.T) {
 	if err := cfsrclone.CloseAll(ctx); err != nil {
 		t.Fatal(err)
 	}
-	b, err := os.ReadFile(filepath.Join(drive, ".cfs", "lease.json"))
-	if err != nil {
-		t.Fatal(err)
+	// The lease is the last file of the lease directory (<epoch>-<heartbeat>-<state>-<writer>.json).
+	ents, err := os.ReadDir(filepath.Join(drive, ".cfs", "lease"))
+	if err != nil || len(ents) == 0 {
+		t.Fatalf("lease directory: %v %v", ents, err)
 	}
-	if !bytes.Contains(b, []byte(`"released":true`)) {
-		t.Fatalf("CloseAll returned while the volume was still closing, lease not released: %s", b)
+	names := make([]string, 0, len(ents))
+	for _, e := range ents {
+		names = append(names, e.Name())
+	}
+	sort.Strings(names)
+	if last := names[len(names)-1]; !strings.Contains(last, "-released-") {
+		t.Fatalf("CloseAll returned while the volume was still closing, lease not released: %v", names)
 	}
 	if err := <-done; err != nil {
 		t.Fatal(err)

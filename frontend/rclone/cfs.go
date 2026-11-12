@@ -113,7 +113,7 @@ func init() {
 			Advanced: true,
 		}, {
 			Name:     "lease_ttl",
-			Help:     "A writer whose heartbeat is older than this is considered dead. The heartbeat (a read and a write of the lease on the remote) runs every third of it.",
+			Help:     "A writer whose heartbeat is older than this is considered dead. The heartbeat (a listing of the lease files on the remote, a new one written and the previous one removed) runs every third of it.",
 			Default:  fs.Duration(30 * time.Minute),
 			Advanced: true,
 		}, {

@@ -3,10 +3,8 @@ package core_test
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"io"
-	"os"
-	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -27,7 +25,7 @@ func TestLeaseReleasedByCloseDespiteAHeartbeatInFlight(t *testing.T) {
 		drive := t.TempDir()
 		pr := &probe{Store: testutil.LocalStore(t, drive)}
 		pr.putHook = func(path string, src store.Source) time.Duration {
-			if path != core.CtlDir+"/lease.json" {
+			if !strings.HasPrefix(path, core.CtlDir+"/lease/") {
 				return 0
 			}
 			rc, err := src.Open()
@@ -55,15 +53,8 @@ func TestLeaseReleasedByCloseDespiteAHeartbeatInFlight(t *testing.T) {
 		if err := v.Close(context.Background()); err != nil {
 			t.Fatal(err)
 		}
-		b, err := os.ReadFile(filepath.Join(drive, ".cfs", "lease.json"))
-		if err != nil {
-			t.Fatal(err)
-		}
-		var l struct {
-			Released bool `json:"released"`
-		}
-		if err := json.Unmarshal(b, &l); err != nil || !l.Released {
-			t.Fatalf("round %d: after Close the lease on the drive is %s", i, b)
+		if l, ok := readLeaseFile(t, drive); !ok || !l.Released {
+			t.Fatalf("round %d: after Close the lease on the drive is %+v (present %v)", i, l, ok)
 		}
 	}
 }
@@ -77,7 +68,7 @@ func TestLeaseSecondCloseWaitsForTheFirst(t *testing.T) {
 	drive := t.TempDir()
 	pr := &probe{Store: testutil.LocalStore(t, drive)}
 	pr.putHook = func(path string, src store.Source) time.Duration {
-		if path == core.CtlDir+"/lease.json" {
+		if strings.HasPrefix(path, core.CtlDir+"/lease/") {
 			rc, err := src.Open()
 			if err == nil {
 				b, _ := io.ReadAll(rc)
@@ -103,12 +94,8 @@ func TestLeaseSecondCloseWaitsForTheFirst(t *testing.T) {
 	if err := v.Close(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	b, err := os.ReadFile(filepath.Join(drive, ".cfs", "lease.json"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Contains(b, []byte(`"released":true`)) {
-		t.Fatalf("the second Close returned before the first had released the lease: %s", b)
+	if l, ok := readLeaseFile(t, drive); !ok || !l.Released {
+		t.Fatalf("the second Close returned before the first had released the lease: %+v (present %v)", l, ok)
 	}
 	if err := <-first; err != nil {
 		t.Fatal(err)

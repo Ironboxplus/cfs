@@ -494,7 +494,7 @@ func (v *Volume) Fsck(ctx context.Context, opts FsckOpts) (FsckReport, error) {
 	if cents, err := v.st.List(ctx, CtlDir); err == nil {
 		for _, e := range cents {
 			switch e.Name() {
-			case "lease.json", "packs", "log", "ckpt":
+			case "lease", "lease.json", "packs", "log", "ckpt":
 			default:
 				add("stray_ctl", CtlDir+"/"+e.Name(), "unexpected entry in the control directory")
 			}

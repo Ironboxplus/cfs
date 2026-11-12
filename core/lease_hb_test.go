@@ -17,8 +17,9 @@ import (
 	"github.com/Ironboxplus/cfs/store"
 )
 
-// leaseCounter counts the reads and writes of lease.json reaching the drive, and
-// can cut the connection: while cut, every call fails like a dead network.
+// leaseCounter counts the reads (listings of the lease directory) and writes of
+// the lease reaching the drive, and can cut the connection: while cut, every
+// call fails like a dead network.
 type leaseCounter struct {
 	store.Store
 	reads, writes atomic.Int64
@@ -31,7 +32,7 @@ func (l *leaseCounter) Put(ctx context.Context, p string, src store.Source, o st
 	if l.cut.Load() {
 		return errNetDown
 	}
-	if p == core.CtlDir+"/lease.json" {
+	if strings.HasPrefix(p, core.CtlDir+"/lease/") {
 		l.writes.Add(1)
 	}
 	return l.Store.Put(ctx, p, src, o)
@@ -41,9 +42,6 @@ func (l *leaseCounter) Open(ctx context.Context, p string, off, n int64) (io.Rea
 	if l.cut.Load() {
 		return nil, errNetDown
 	}
-	if p == core.CtlDir+"/lease.json" {
-		l.reads.Add(1)
-	}
 	return l.Store.Open(ctx, p, off, n)
 }
 
@@ -51,7 +49,17 @@ func (l *leaseCounter) List(ctx context.Context, dir string) ([]store.Entry, err
 	if l.cut.Load() {
 		return nil, errNetDown
 	}
+	if dir == core.CtlDir+"/lease" {
+		l.reads.Add(1)
+	}
 	return l.Store.List(ctx, dir)
+}
+
+func (l *leaseCounter) Remove(ctx context.Context, p string) error {
+	if l.cut.Load() {
+		return errNetDown
+	}
+	return l.Store.Remove(ctx, p)
 }
 
 func (l *leaseCounter) Stat(ctx context.Context, p string) (store.Entry, error) {

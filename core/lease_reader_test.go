@@ -3,7 +3,6 @@ package core_test
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -65,31 +64,20 @@ func sameDrive(t *testing.T, what string, before, after map[string]string) {
 }
 
 type leaseFile struct {
-	Writer   string `json:"writer"`
-	Epoch    uint64 `json:"epoch"`
-	Released bool   `json:"released"`
+	Writer   string
+	Epoch    uint64
+	Released bool
 }
 
+// readLeaseFile is the lease on the drive: the last file of the lease directory.
 func readLeaseFile(t *testing.T, drive string) (leaseFile, bool) {
 	t.Helper()
-	var last error
-	// The drive replaces the file in place: a read can catch it half written.
-	for i := 0; i < 50; i++ {
-		b, err := os.ReadFile(filepath.Join(drive, ".cfs", "lease.json"))
-		if os.IsNotExist(err) {
-			return leaseFile{}, false
-		}
-		if err == nil {
-			var l leaseFile
-			if err = json.Unmarshal(b, &l); err == nil {
-				return l, true
-			}
-		}
-		last = err
-		time.Sleep(10 * time.Millisecond)
+	files := leaseFiles(t, drive)
+	if len(files) == 0 {
+		return leaseFile{}, false
 	}
-	t.Fatalf("lease.json: %v", last)
-	return leaseFile{}, false
+	n := parseLeaseFile(t, files[len(files)-1])
+	return leaseFile{Writer: n.writer, Epoch: n.epoch, Released: n.state == "released"}, true
 }
 
 // waitFor polls until cond holds.

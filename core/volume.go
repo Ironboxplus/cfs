@@ -125,6 +125,13 @@ type Volume struct {
 	leaseMu    sync.Mutex   // one lease write at a time: the heartbeat and the release
 	leaseDone  bool         // the lease has been released: no heartbeat writes it again; leaseMu
 	leaseAt    atomic.Int64 // unix nanos of the last successful read or write of the lease
+
+	// The lease files (see readLease); leaseFilesMu guards them.
+	leaseFilesMu sync.Mutex
+	leaseSeen    []string // names the last listing of the lease directory found
+	leaseOld     []string // names that the next write of the lease supersedes and removes
+	leaseLegacy  bool     // the last listing fell back to lease.json, which a write removes
+	leaseLastHB  int64    // heartbeat of the last lease file written, in unix millis
 }
 
 func (v *Volume) logf(format string, args ...any) { v.cfg.Logf(format, args...) }
@@ -335,6 +342,21 @@ func parentOf(p string) string { d, _ := splitPath(p); return d }
 
 // ---- lease ----
 
+// The lease is a directory of small files, each written once under a name of
+// its own and never rewritten. The drive has no atomic replace: a file
+// rewritten in place can be read half written, or as the version it is
+// replacing, and on 115 it was (JOURNAL 2026-11-12, cfs 1). restic's locks
+// work this way (internal/repository/lock_file.go): a refresh writes a new
+// file and then removes the old one. The name says all that the lease says,
+// so who holds it is known from a listing, without reading a file: there is no
+// unreadable lease to mistake for no lease.
+const leaseDir = CtlDir + "/lease"
+
+// legacyLeasePath is where versions before the lease directory kept the lease,
+// rewritten in place. It is looked at while the directory is empty, and the
+// first write of the lease removes it.
+const legacyLeasePath = CtlDir + "/lease.json"
+
 type lease struct {
 	Writer    string `json:"writer"`
 	Epoch     uint64 `json:"epoch"`
@@ -343,51 +365,147 @@ type lease struct {
 	Host      string `json:"host,omitempty"`
 }
 
-const leasePath = CtlDir + "/lease.json"
-
-// readLease reads the lease file. The drive may replace the file in place, so a
-// read that catches it half written is retried before it counts as an error.
-func (v *Volume) readLease(ctx context.Context) (lease, bool, error) {
-	var lastErr error
-	for i := 0; i < 8; i++ {
-		if i > 0 {
-			select {
-			case <-time.After(time.Duration(i) * 20 * time.Millisecond):
-			case <-ctx.Done():
-				return lease{}, false, ctx.Err()
-			}
-		}
-		rc, err := v.st.Open(ctx, leasePath, 0, -1)
-		if errors.Is(err, store.ErrNotFound) {
-			return lease{}, false, nil
-		}
-		if err != nil {
-			return lease{}, false, err
-		}
-		var l lease
-		err = json.NewDecoder(rc).Decode(&l)
-		rc.Close()
-		if err == nil {
-			return l, true, nil
-		}
-		lastErr = err
+// fileName is l's name in leaseDir: <epoch>-<heartbeat>-<held|released>-<writer>.json,
+// the numbers zero-padded so that names sort as leases do.
+func (l lease) fileName() string {
+	state := "held"
+	if l.Released {
+		state = "released"
 	}
-	return lease{}, false, fmt.Errorf("%w: %v", errBadLease, lastErr)
+	return fmt.Sprintf("%020d-%020d-%s-%s.json", l.Epoch, l.Heartbeat, state, l.Writer)
 }
 
-// errBadLease is a lease file that stays unreadable: a writer that died while
-// rewriting it (the drive has no atomic replace) leaves it truncated for good.
-var errBadLease = errors.New("cfs: unreadable lease")
+// parseLeaseName is the lease a name in leaseDir stands for.
+func parseLeaseName(name string) (lease, bool) {
+	base, ok := strings.CutSuffix(name, ".json")
+	parts := strings.SplitN(base, "-", 4)
+	if !ok || len(parts) != 4 || parts[3] == "" || (parts[2] != "held" && parts[2] != "released") {
+		return lease{}, false
+	}
+	epoch, err1 := strconv.ParseUint(parts[0], 10, 64)
+	hb, err2 := strconv.ParseInt(parts[1], 10, 64)
+	if err1 != nil || err2 != nil {
+		return lease{}, false
+	}
+	return lease{Writer: parts[3], Epoch: epoch, Heartbeat: hb, Released: parts[2] == "released"}, true
+}
 
+// after reports whether l comes after o: a higher epoch, or in the same epoch a
+// later heartbeat.
+func (l lease) after(o lease) bool {
+	if l.Epoch != o.Epoch {
+		return l.Epoch > o.Epoch
+	}
+	if l.Heartbeat != o.Heartbeat {
+		return l.Heartbeat > o.Heartbeat
+	}
+	return l.Released && !o.Released
+}
+
+// readLease returns the lease: the last of the files in leaseDir, or with none
+// there, the legacy file.
+func (v *Volume) readLease(ctx context.Context) (lease, bool, error) {
+	ents, err := v.st.List(ctx, leaseDir)
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		return lease{}, false, err
+	}
+	var l lease
+	var ok bool
+	var seen []string
+	for _, e := range ents {
+		c, good := parseLeaseName(e.Name())
+		if e.IsDir || !good {
+			continue
+		}
+		seen = append(seen, e.Name())
+		if !ok || c.after(l) {
+			l, ok = c, true
+		}
+	}
+	v.leaseFilesMu.Lock()
+	v.leaseSeen = seen
+	v.leaseFilesMu.Unlock()
+	if ok {
+		return l, true, nil
+	}
+	return v.readLegacyLease(ctx)
+}
+
+// readLegacyLease reads lease.json. One that can't be read is not taken for no
+// lease (restic, lock_file.go: "if we cannot load a lock then it is unclear
+// whether it can be ignored"): it is held, by a writer nobody knows, since it
+// was last modified.
+func (v *Volume) readLegacyLease(ctx context.Context) (lease, bool, error) {
+	e, err := v.st.Stat(ctx, legacyLeasePath)
+	if errors.Is(err, store.ErrNotFound) {
+		return lease{}, false, nil
+	}
+	if err != nil {
+		return lease{}, false, err
+	}
+	v.leaseFilesMu.Lock()
+	v.leaseLegacy = true
+	v.leaseFilesMu.Unlock()
+	rc, err := v.st.Open(ctx, legacyLeasePath, 0, -1)
+	if errors.Is(err, store.ErrNotFound) {
+		return lease{}, false, nil
+	}
+	if err != nil {
+		return lease{}, false, err
+	}
+	var l lease
+	err = json.NewDecoder(rc).Decode(&l)
+	rc.Close()
+	if err != nil {
+		v.logf("cfs: %s can't be read (%v): held since %s", legacyLeasePath, err, e.ModTime.Format(time.RFC3339))
+		return lease{Heartbeat: e.ModTime.UnixMilli()}, true, nil
+	}
+	return l, true, nil
+}
+
+// writeLease writes this writer's lease as a new file, and then removes what it
+// supersedes: the file this writer wrote before, the files the last listing
+// found (none of them comes after it: the writer would have been fenced, or
+// would not have taken the lease) and lease.json. A removal that fails is
+// tried again after the next write.
 func (v *Volume) writeLease(ctx context.Context, released bool) error {
-	l := lease{Writer: v.writerID, Epoch: v.epoch, Heartbeat: time.Now().UnixMilli(), Released: released}
+	v.leaseFilesMu.Lock()
+	defer v.leaseFilesMu.Unlock()
+	l := lease{Writer: v.writerID, Epoch: v.epoch, Heartbeat: max(time.Now().UnixMilli(), v.leaseLastHB+1), Released: released}
 	l.Host, _ = os.Hostname()
 	b, _ := json.Marshal(l)
-	err := v.st.Put(ctx, leasePath, store.Bytes(b), store.PutOpts{Size: int64(len(b)), ModTime: time.Now()})
-	if err == nil {
-		v.leaseAt.Store(time.Now().UnixNano())
+	name := l.fileName()
+	if err := v.st.Put(ctx, leaseDir+"/"+name, store.Bytes(b), store.PutOpts{Size: int64(len(b)), ModTime: time.Now(), Unique: true}); err != nil {
+		return err
 	}
-	return err
+	v.leaseAt.Store(time.Now().UnixNano())
+	v.leaseLastHB = l.Heartbeat
+	old := v.leaseOld
+	for _, n := range v.leaseSeen {
+		if c, ok := parseLeaseName(n); ok && l.after(c) {
+			old = append(old, n)
+		}
+	}
+	v.leaseSeen, v.leaseOld = nil, []string{name}
+	done := map[string]bool{name: true}
+	for _, n := range old {
+		if done[n] {
+			continue
+		}
+		done[n] = true
+		if err := v.st.Remove(ctx, leaseDir+"/"+n); err != nil && !errors.Is(err, store.ErrNotFound) {
+			v.logf("cfs: removing the old lease file %s: %v", n, err)
+			v.leaseOld = append(v.leaseOld, n)
+		}
+	}
+	if v.leaseLegacy {
+		if err := v.st.Remove(ctx, legacyLeasePath); err != nil && !errors.Is(err, store.ErrNotFound) {
+			v.logf("cfs: removing %s: %v", legacyLeasePath, err)
+		} else {
+			v.leaseLegacy = false
+		}
+	}
+	return nil
 }
 
 // maxDriveEpoch is the highest epoch visible on the drive.
@@ -413,23 +531,11 @@ func (v *Volume) maxDriveEpoch(ctx context.Context, l lease, haveLease bool) (ui
 	return m, nil
 }
 
-// readLeaseOrAbsent is readLease, with a lease that stays unreadable counted as
-// absent: nobody can be heartbeating into a file that has stayed unreadable
-// through all the retries.
-func (v *Volume) readLeaseOrAbsent(ctx context.Context) (lease, bool, error) {
-	l, ok, err := v.readLease(ctx)
-	if errors.Is(err, errBadLease) {
-		v.logf("cfs: %v: taking the volume over", err)
-		return lease{}, false, nil
-	}
-	return l, ok, err
-}
-
 // takeLease is what Open does about the lease. A volume with no work of its own
 // left from an earlier run only looks at it and starts as a reader, writing
 // nothing; one with such work takes the lease (acquire).
 func (v *Volume) takeLease(ctx context.Context, asWriter bool) error {
-	l, ok, err := v.readLeaseOrAbsent(ctx)
+	l, ok, err := v.readLease(ctx)
 	if err != nil {
 		return err
 	}
