@@ -614,6 +614,9 @@ func TestReadFsckStreamsThePack(t *testing.T) {
 		c.Threshold = 8 << 20
 		c.Ack = core.AckStaged
 		c.SealQuiet, c.SealMax = time.Hour, time.Hour
+		// The allocations are counted process-wide: no heartbeat (a listing, a
+		// write and a removal of lease files) runs while they are.
+		c.LeaseTTL = 30 * time.Minute
 	})
 	for i := 0; i < 8; i++ {
 		e.put(t, fmt.Sprintf("pk/f%d", i), randBytes(member))
