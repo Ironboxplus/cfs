@@ -48,7 +48,7 @@ func Retry(s store.Store, o RetryOpts) store.Store {
 func definite(err error) bool {
 	return errors.Is(err, store.ErrNotFound) || errors.Is(err, store.ErrExists) ||
 		errors.Is(err, store.ErrNotEmpty) || errors.Is(err, store.ErrIsDir) ||
-		errors.Is(err, store.ErrNotDir) || errors.Is(err, store.ErrNotSupported) ||
+		errors.Is(err, store.ErrNotDir) || errors.Is(err, store.ErrNotSupported) || errors.Is(err, store.ErrChanged) ||
 		errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
 
@@ -106,8 +106,8 @@ func (r *retry) Open(ctx context.Context, p string, off, n int64) (out io.ReadCl
 	return
 }
 
-func (r *retry) OpenStream(ctx context.Context, p string, off, n int64) (out io.ReadCloser, err error) {
-	err = r.do(ctx, func() (e error) { out, e = r.Store.OpenStream(ctx, p, off, n); return }, nil)
+func (r *retry) OpenStream(ctx context.Context, p string, off, n int64, want store.Entry) (out io.ReadCloser, err error) {
+	err = r.do(ctx, func() (e error) { out, e = r.Store.OpenStream(ctx, p, off, n, want); return }, nil)
 	return
 }
 

@@ -155,11 +155,11 @@ func (m *Meter) Hash(ctx context.Context, p string) (string, error) {
 
 // OpenStream counts the call and the bytes. The body is not part of the in-flight
 // peaks: a stream is paced by its consumer and holds no slot.
-func (m *Meter) OpenStream(ctx context.Context, p string, off, n int64) (io.ReadCloser, error) {
+func (m *Meter) OpenStream(ctx context.Context, p string, off, n int64, want store.Entry) (io.ReadCloser, error) {
 	m.mu.Lock()
 	m.calls["openstream"]++
 	m.mu.Unlock()
-	rc, err := m.Store.OpenStream(ctx, p, off, n)
+	rc, err := m.Store.OpenStream(ctx, p, off, n, want)
 	if err != nil {
 		return nil, err
 	}

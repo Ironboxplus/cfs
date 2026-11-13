@@ -148,10 +148,14 @@ func TestGateStreamHoldsNoSlotAfterOpen(t *testing.T) {
 	ctx := context.Background()
 	st := testutil.LocalStore(t, t.TempDir())
 	st.Put(ctx, "a", store.Bytes(make([]byte, 1<<16)), store.PutOpts{Size: 1 << 16})
+	want, err := st.Stat(ctx, "a")
+	if err != nil {
+		t.Fatal(err)
+	}
 	g := aspect.Gate(st, aspect.GateOpts{ReadTransfers: 1})
 	var open []io.ReadCloser
 	for i := 0; i < 5; i++ {
-		rc, err := g.OpenStream(ctx, "a", 0, -1)
+		rc, err := g.OpenStream(ctx, "a", 0, -1, want)
 		if err != nil {
 			t.Fatal(err)
 		}

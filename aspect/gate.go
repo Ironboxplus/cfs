@@ -190,12 +190,12 @@ func (g *gate) Open(ctx context.Context, p string, off, n int64) (io.ReadCloser,
 // consumer, and a paused client must not keep a slot that bounded reads need.
 // (JuiceFS holds its download slot for one bounded block request only,
 // pkg/chunk/cached_store.go load.)
-func (g *gate) OpenStream(ctx context.Context, p string, off, n int64) (io.ReadCloser, error) {
+func (g *gate) OpenStream(ctx context.Context, p string, off, n int64, want store.Entry) (io.ReadCloser, error) {
 	if err := g.acquire(ctx, Read); err != nil {
 		return nil, err
 	}
 	defer g.release(Read)
-	return g.Store.OpenStream(ctx, p, off, n)
+	return g.Store.OpenStream(ctx, p, off, n, want)
 }
 
 // slotReader returns its read slot at EOF or Close, whichever comes first.

@@ -69,21 +69,31 @@ func (v *Volume) Open(ctx context.Context, p string, off, n int64) (io.ReadClose
 		}
 		return &heldReader{ReadCloser: sliceReader(data, off, n), release: release}, nil
 	}
-	e, err := v.Stat(ctx, p)
-	if err != nil {
-		return nil, err
+	for try := 0; ; try++ {
+		e, err := v.Stat(ctx, p)
+		if err != nil {
+			return nil, err
+		}
+		if e.IsDir {
+			return nil, store.ErrIsDir
+		}
+		end := e.Size
+		if n >= 0 && off+n < end {
+			end = off + n
+		}
+		if off >= end {
+			return io.NopCloser(bytes.NewReader(nil)), nil
+		}
+		rc, err := v.st.OpenStream(ctx, p, off, end-off, store.Entry{Path: p, Size: e.Size, ModTime: e.ModTime})
+		// The listing this size came from is older than the file on the drive (another
+		// node replaced it): list the folder again and read what is there now.
+		if errors.Is(err, store.ErrChanged) && try == 0 {
+			dir, _ := splitPath(p)
+			v.dc.forget(dir)
+			continue
+		}
+		return rc, err
 	}
-	if e.IsDir {
-		return nil, store.ErrIsDir
-	}
-	end := e.Size
-	if n >= 0 && off+n < end {
-		end = off + n
-	}
-	if off >= end {
-		return io.NopCloser(bytes.NewReader(nil)), nil
-	}
-	return v.st.OpenStream(ctx, p, off, end-off)
 }
 
 func sliceReader(data []byte, off, n int64) io.ReadCloser {

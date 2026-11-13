@@ -60,15 +60,19 @@ type probeOpen struct {
 var errInjected = errors.New("injected read error")
 
 // OpenStream counts like Open: the probe sees every body.
-func (p *probe) OpenStream(ctx context.Context, path string, off, n int64) (io.ReadCloser, error) {
-	return p.Open(ctx, path, off, n)
+func (p *probe) OpenStream(ctx context.Context, path string, off, n int64, want store.Entry) (io.ReadCloser, error) {
+	return p.opened(path, off, n, func() (io.ReadCloser, error) { return p.Store.OpenStream(ctx, path, off, n, want) })
 }
 
 func (p *probe) Open(ctx context.Context, path string, off, n int64) (io.ReadCloser, error) {
+	return p.opened(path, off, n, func() (io.ReadCloser, error) { return p.Store.Open(ctx, path, off, n) })
+}
+
+func (p *probe) opened(path string, off, n int64, open func() (io.ReadCloser, error)) (io.ReadCloser, error) {
 	if p.delay > 0 {
 		time.Sleep(p.delay)
 	}
-	rc, err := p.Store.Open(ctx, path, off, n)
+	rc, err := open()
 	if err != nil {
 		return nil, err
 	}

@@ -20,6 +20,9 @@ var (
 	ErrIsDir        = errors.New("cfs/store: is a directory")
 	ErrNotDir       = errors.New("cfs/store: not a directory")
 	ErrNotSupported = errors.New("cfs/store: not supported")
+	// ErrChanged: the file at the path is no longer the one the caller listed
+	// (another node replaced it).
+	ErrChanged = errors.New("cfs/store: file changed")
 )
 
 // Entry describes a file or directory.
@@ -83,7 +86,9 @@ type Store interface {
 	// bounded reads that are read and closed at once, and a decorator may keep a
 	// shared slot for them until the body is closed; a stream must not hold a shared
 	// resource while it is open, so a decorator may only limit the call itself.
-	OpenStream(ctx context.Context, p string, off, n int64) (io.ReadCloser, error)
+	// want is the entry the caller listed: if the file at p is not that one (size,
+	// modification time) the store returns ErrChanged instead of reading it.
+	OpenStream(ctx context.Context, p string, off, n int64, want Entry) (io.ReadCloser, error)
 	// Put writes (or overwrites) a file, creating missing parent directories.
 	Put(ctx context.Context, p string, src Source, o PutOpts) error
 	Remove(ctx context.Context, p string) error

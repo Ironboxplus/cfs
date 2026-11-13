@@ -166,6 +166,10 @@ func (s *Store) Open(ctx context.Context, p string, off, n int64) (io.ReadCloser
 	if err != nil {
 		return nil, err
 	}
+	return s.open(ctx, p, o, off, n)
+}
+
+func (s *Store) open(ctx context.Context, p string, o fs.Object, off, n int64) (io.ReadCloser, error) {
 	var opts []fs.OpenOption
 	if off > 0 || n >= 0 {
 		end := int64(-1)
@@ -189,9 +193,33 @@ func (s *Store) Open(ctx context.Context, p string, off, n int64) (io.ReadCloser
 }
 
 // OpenStream is Open: nothing here holds a slot for the body, and a break in the
-// middle is repaired by operations.Open either way.
-func (s *Store) OpenStream(ctx context.Context, p string, off, n int64) (io.ReadCloser, error) {
-	return s.Open(ctx, p, off, n)
+// middle is repaired by operations.Open either way. The object is compared with
+// the entry the caller listed (the way rclone's VFS compares the fingerprint of
+// the remote object with what it cached, vfscache/item.go _checkObject): if the
+// remembered one differs it is looked up again, and if the new one still differs
+// the file was replaced and ErrChanged says so, rather than reading the new file
+// by the old length.
+func (s *Store) OpenStream(ctx context.Context, p string, off, n int64, want store.Entry) (io.ReadCloser, error) {
+	o, err := s.object(ctx, p)
+	if err != nil {
+		return nil, err
+	}
+	if !sameEntry(ctx, o, want) {
+		s.forget(p)
+		if o, err = s.object(ctx, p); err != nil {
+			return nil, err
+		}
+		if !sameEntry(ctx, o, want) {
+			return nil, store.ErrChanged
+		}
+	}
+	return s.open(ctx, p, o, off, n)
+}
+
+// sameEntry reports whether o still has the size and modification time that were
+// listed.
+func sameEntry(ctx context.Context, o fs.Object, want store.Entry) bool {
+	return o.Size() == want.Size && (want.ModTime.IsZero() || o.ModTime(ctx).Equal(want.ModTime))
 }
 
 func (s *Store) Put(ctx context.Context, p string, src store.Source, o store.PutOpts) error {
