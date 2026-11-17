@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128" role="img" aria-label="cfs">
+  <title>cfs</title>
+  <g transform="translate(-2.75 0)" stroke-linejoin="round">
+    <!-- the drive -->
+    <path d="M34 98H98A22 22 0 0 0 100 54A30 30 0 0 0 44 46A24 24 0 0 0 34 98Z" fill="#EEF4FA" stroke="#2F5F8F" stroke-width="5"/>
+    <!-- a pack of small files -->
+    <rect x="30" y="53" width="52" height="37" rx="6" fill="#FFFFFF" stroke="#2B7A57" stroke-width="3"/>
+    <g fill="#2B7A57">
+      <rect x="35" y="58" width="12" height="12" rx="2.5"/>
+      <rect x="50" y="58" width="12" height="12" rx="2.5" opacity="0.7"/>
+      <rect x="65" y="58" width="12" height="12" rx="2.5"/>
+      <rect x="35" y="73" width="12" height="12" rx="2.5" opacity="0.7"/>
+      <rect x="50" y="73" width="12" height="12" rx="2.5"/>
+      <rect x="65" y="73" width="12" height="12" rx="2.5" opacity="0.7"/>
+    </g>
+    <!-- a large file, stored as it is -->
+    <rect x="87" y="53" width="12" height="37" rx="3" fill="#B5691C"/>
+  </g>
+</svg>
